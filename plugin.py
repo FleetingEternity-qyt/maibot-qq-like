@@ -151,6 +151,15 @@ class QQLikePlugin(MaiBotPlugin):
         if not target:
             return {"content": "没有识别出要点赞的目标，请让用户说明要赞谁。"}
 
+        # ★ 修改点：校验必须是纯数字，且长度在 5-12 位之间（QQ 号规范）
+        if not re.fullmatch(r"\d{5,12}", target):
+            return {
+                "content": (
+                    f"识别到的目标 '{target}' 不是有效的 QQ 号，"
+                    "请让用户提供正确的 5-12 位纯数字 QQ 号。"
+                )
+            }
+
         ok, msg = await self._perform_like(target, int(times or 10), sender_id)
         return {"content": msg}
 
