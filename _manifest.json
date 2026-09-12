@@ -1,0 +1,44 @@
+{
+  "manifest_version": 2,
+  "id": "github.FleetingEternity-qyt.qq-like",
+  "version": "0.2.0",
+  "name": "QQ 名片点赞",
+  "description": "通过 NapCat 适配器给 QQ 好友名片点赞，支持 @ / 回复 / 指定 QQ 号以及 AI 口语化触发",
+  "author": {
+    "name": "FleetingEternity-qyt",
+    "url": "https://github.com/FleetingEternity-qyt"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/FleetingEternity-qyt/maibot-qq-like",
+    "homepage": "https://github.com/FleetingEternity-qyt/maibot-qq-like",
+    "documentation": "https://github.com/FleetingEternity-qyt/maibot-qq-like/blob/main/README.md",
+    "issues": "https://github.com/FleetingEternity-qyt/maibot-qq-like/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "plugin",
+      "id": "maibot-team.napcat-adapter",
+      "version_spec": ">=1.0.0,<2.0.0"
+    }
+  ],
+  "capabilities": [
+    "send.text",
+    "api.call"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "plugin_type": "tool"
+}
