@@ -16,7 +16,7 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "0.2.0"
+SUPPORTED_CONFIG_VERSION = "0.2.2"
 
 SEND_LIKE_API = "adapter.napcat.account.send_like"
 GET_LOGIN_INFO_API = "adapter.napcat.system.get_login_info"
@@ -44,9 +44,9 @@ class LikeSectionConfig(PluginConfigBase):
     __ui_icon__ = "thumb_up"
     __ui_order__ = 1
 
-    default_times: int = Field(default=10, ge=1, le=10, description="未指定次数时的默认点赞次数")
-    max_times: int = Field(default=10, ge=1, le=10, description="单次命令允许的最大点赞次数")
-    daily_limit_per_target: int = Field(default=10, ge=1, le=50, description="同一目标每天最多被点赞的次数")
+    default_times: int = Field(default=10, ge=1, le=20, description="未指定次数时的默认点赞次数")
+    max_times: int = Field(default=20, ge=1, le=20, description="单次命令允许的最大点赞次数")
+    daily_limit_per_target: int = Field(default=30, ge=1, le=50, description="同一目标每天最多被点赞的次数")
     cooldown_seconds: int = Field(default=30, ge=0, le=3600, description="同一用户触发命令的冷却秒数")
     allow_at_target: bool = Field(default=True, description="允许通过 @某人 指定目标")
     allow_reply_target: bool = Field(default=True, description="允许通过回复消息指定目标")
@@ -109,12 +109,13 @@ class QQLikePlugin(MaiBotPlugin):
         "like_qq_profile",
         brief_description="给 QQ 用户名片点赞",
         detailed_description=(
-            "当用户在聊天中请求给某人点赞时调用此工具。\n"
-            "触发场景举例：'给我点个赞'、'帮我点赞'、'给某某点赞'、'给 123456789 点赞'、'帮我给群友点个赞'。\n"
+            "当用户在聊天中请求给某人点赞时，你【必须】调用此工具。\n"
+            "触发场景：用户说'给我点个赞'、'帮我点赞'、'给某某点赞'、'给 123456789 点赞'、'帮我给群友点个赞'。\n"
             "参数说明：\n"
             "- target_qq：string，可选。要点赞的 QQ 号。不填则默认给当前发言者点赞。\n"
-            "- times：integer，可选。点赞次数，默认 10。\n"
-            "调用后请用自然口语回复用户，例如'好嘞，已经给你点满啦~'。"
+            "- times：integer，可选。点赞次数，默认 10，最大 20。\n"
+            "【重要指示】：如果用户在话语中明确提出了数字（例如'点20个赞'、'给我来15个赞'），你【必须】准确提取这个数字，并填入 times 参数中！绝对不能因为默认值是 10 就无视用户的要求！如果用户说'点满'，则填入 20。\n"
+            "调用后请用自然口语回复用户，例如'好嘞，已经给你点满20个赞啦~'。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -127,7 +128,7 @@ class QQLikePlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="times",
                 param_type=ToolParamType.INTEGER,
-                description="点赞次数，默认 10",
+                description="点赞次数，如果用户明确要求了次数（如'点20个赞'），必须准确传递该数字！",
                 required=False,
                 default=10,
             ),
@@ -137,22 +138,52 @@ class QQLikePlugin(MaiBotPlugin):
     async def tool_like_qq_profile(
         self, target_qq: str = "", times: int = 10, **kwargs: Any
     ) -> dict[str, Any]:
+        # ★ 调试日志：记录工具被 AI 调用的瞬间，以及 AI 传了啥参数
+        self.ctx.logger.info("[QQ点赞-调试] AI 成功调用了 like_qq_profile 工具！target_qq=%s, times=%s", target_qq, times)
+
         if not self.config.plugin.enabled or not self.config.like.enable_llm_tool:
+            self.ctx.logger.warning("[QQ点赞-调试] 插件未启用或 llm_tool 未开启")
             return {"content": "点赞功能当前未启用。"}
 
         message = kwargs.get("message") or {}
         if not isinstance(message, dict):
             message = {}
 
+        # ★ 兜底逻辑：如果 AI 没提取对次数，从用户原话里强行抠出来！
+        user_text = message.get("processed_plain_text", "")
+        if not user_text:
+            user_text = str(kwargs.get("text", ""))
+        
+        if user_text and times == 10:  # 只有当 AI 用了默认值 10 时，才去检查用户原话
+            # 匹配 "20个赞"、"20次点赞"
+            match = re.search(r"(\d+)\s*(?:个|次)?\s*(?:赞|点赞)", user_text)
+            if match:
+                try:
+                    extracted = int(match.group(1))
+                    if 1 <= extracted <= self.config.like.max_times:
+                        times = extracted
+                        self.ctx.logger.info("[QQ点赞-调试] 从用户原话提取到次数 %s，覆盖 AI 的默认值", times)
+                except ValueError:
+                    pass
+            elif "点满" in user_text or "全部点亮" in user_text:
+                times = self.config.like.max_times
+                self.ctx.logger.info("[QQ点赞-调试] 识别到'点满'，设置次数为 %s", times)
+
         sender_id = self._sender_id_from_message(message)
+        if not sender_id:
+            sender_id = str(kwargs.get("user_id") or kwargs.get("sender_id") or "")
+            self.ctx.logger.info("[QQ点赞-调试] 从 kwargs 兜底获取 sender_id=%s", sender_id)
+
         target = self._normalize_user_id(str(target_qq or ""))
         if not target:
             target = sender_id
         if not target:
+            self.ctx.logger.warning("[QQ点赞-调试] 未能识别目标，sender_id 和 target_qq 都为空")
             return {"content": "没有识别出要点赞的目标，请让用户说明要赞谁。"}
 
-        # ★ 修改点：校验必须是纯数字，且长度在 5-12 位之间（QQ 号规范）
+        # 校验必须是纯数字，且长度在 5-12 位之间
         if not re.fullmatch(r"\d{5,12}", target):
+            self.ctx.logger.warning("[QQ点赞-调试] 目标 '%s' 不是纯数字，拦截", target)
             return {
                 "content": (
                     f"识别到的目标 '{target}' 不是有效的 QQ 号，"
@@ -160,7 +191,9 @@ class QQLikePlugin(MaiBotPlugin):
                 )
             }
 
+        self.ctx.logger.info("[QQ点赞-调试] 准备执行点赞: target=%s, times=%s, sender=%s", target, times, sender_id)
         ok, msg = await self._perform_like(target, int(times or 10), sender_id)
+        self.ctx.logger.info("[QQ点赞-调试] 执行结果: ok=%s, msg=%s", ok, msg)
         return {"content": msg}
 
     # ------------------------------------------------------------------ #
@@ -237,12 +270,14 @@ class QQLikePlugin(MaiBotPlugin):
             self._write_state()
 
         try:
+            self.ctx.logger.info("[QQ点赞-调试] 正在调用适配器 API: %s, params=%s", SEND_LIKE_API, {"user_id": int(target_id), "times": times})
             resp = await self.ctx.api.call(
                 SEND_LIKE_API,
                 params={"user_id": int(target_id), "times": times},
             )
+            self.ctx.logger.info("[QQ点赞-调试] 适配器 API 返回: %s", resp)
         except Exception as exc:
-            self.ctx.logger.exception("调用 %s 失败", SEND_LIKE_API)
+            self.ctx.logger.exception("[QQ点赞-调试] 调用 %s 失败", SEND_LIKE_API)
             return False, f"点赞失败：{exc}"
 
         if isinstance(resp, dict) and resp.get("success") is False:
@@ -280,7 +315,7 @@ class QQLikePlugin(MaiBotPlugin):
                 continue
             if 5 <= len(token) <= 12:
                 target = target or token
-            elif 1 <= len(token) <= 2 and 1 <= int(token) <= 10:
+            elif 1 <= len(token) <= 2 and 1 <= int(token) <= 20:
                 times = times if times is not None else int(token)
         return target, times
 
