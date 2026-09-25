@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.FleetingEternity-qyt.qq-like",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "name": "QQ 名片点赞",
   "description": "通过 NapCat 适配器给 QQ 好友名片点赞，支持 @ / 回复 / 指定 QQ 号以及 AI 口语化触发",
   "author": {
