@@ -24,15 +24,15 @@
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | enabled | true | 是否启用插件 |
-| config_version | "0.2.0" | 配置版本（请勿修改） |
+| config_version | "0.2.3" | 配置版本（请勿修改） |
 
 ### [like] 点赞设置
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | default_times | 10 | 默认点赞次数 |
-| max_times | 10 | 单次最大点赞次数 |
-| daily_limit_per_target | 10 | 每目标每日上限 |
+| max_times | 20 | 单次最大点赞次数 |
+| daily_limit_per_target | 30 | 每目标每日上限 |
 | cooldown_seconds | 30 | 命令冷却秒数（0=不限制） |
 | allow_at_target | true | 允许通过 @某人 指定目标 |
 | allow_reply_target | true | 允许通过回复消息指定目标 |
