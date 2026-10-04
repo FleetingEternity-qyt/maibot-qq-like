@@ -16,8 +16,7 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-
-SUPPORTED_CONFIG_VERSION = "0.2.4"
+SUPPORTED_CONFIG_VERSION = "0.2.5"
 
 SEND_LIKE_API = "adapter.napcat.account.send_like"
 GET_LOGIN_INFO_API = "adapter.napcat.system.get_login_info"
@@ -96,7 +95,7 @@ class LikeSectionConfig(PluginConfigBase):
 
     enable_llm_tool: bool = Field(
         default=True,
-        description="启用 AI 口语化触发",
+        description="启用 AI 口语化触发（关闭后 AI 将无法主动触发，仅允许命令触发，需重启插件生效）",
     )
 
 
@@ -107,12 +106,12 @@ class AdminSectionConfig(PluginConfigBase):
 
     admin_only: bool = Field(
         default=True,
-        description="是否仅允许管理员使用",
+        description="是否仅允许管理员使用（默认开启，需在下方配置管理员QQ，否则所有人都无法使用）",
     )
 
     admins: str = Field(
         default="",
-        description="管理员 QQ 号，逗号分隔",
+        description="管理员 QQ 号，逗号分隔（开启 admin_only 后必填）",
         json_schema_extra={"placeholder": "123456789, qq:987654321"},
     )
 
@@ -155,16 +154,9 @@ class QQLikePlugin(MaiBotPlugin):
         self._self_id_failed_until: float = 0.0
 
         # 正在执行中的点赞请求
-        #
-        # 作用：
-        # 防止两个并发请求同时看到：
-        # used=20 / limit=30
-        # 然后各自点赞 10 次，最终突破每日额度。
         self._pending_target_counts: dict[str, int] = {}
 
         # 正在冷却中的用户
-        #
-        # 不立即写入持久化状态，只有 API 成功后才真正提交 cooldown。
         self._pending_cooldowns: dict[str, float] = {}
 
     async def on_load(self) -> None:
@@ -174,10 +166,18 @@ class QQLikePlugin(MaiBotPlugin):
         self._state_path = data_dir / STATE_FILE_NAME
         self._state = self._read_state()
 
+        # 针对默认配置锁死的问题，在加载时给出明确警告
+        if self.config.admin.admin_only and not self.config.admin.admins.strip():
+            self.ctx.logger.warning(
+                "⚠️ 安全警告：admin_only 已开启，但 admins 列表为空！"
+                "请在 WebUI 插件配置中填入至少一个管理员 QQ 号，否则任何人都无法使用点赞功能。"
+            )
+
         self.ctx.logger.info(
-            "QQ 名片点赞插件已加载 enabled=%s, llm_tool=%s",
+            "QQ 名片点赞插件已加载 enabled=%s, llm_tool=%s, admin_only=%s",
             self.config.plugin.enabled,
             self.config.like.enable_llm_tool,
+            self.config.admin.admin_only,
         )
 
     async def on_unload(self) -> None:
@@ -214,7 +214,7 @@ class QQLikePlugin(MaiBotPlugin):
             "- times：integer，可选。点赞次数，默认 10，最大 20。\n"
             "重要：如果用户明确提出点赞次数，例如'点20个赞'、"
             "'给我来15个赞'，必须准确提取这个数字并填入 times。\n"
-            "如果用户说'点满'或'全部点亮'，则填入 20。\n"
+            "如果用户说'点满'或'全部点亮'，则填入最大值。\n"
             "调用后请用自然口语回复用户。"
         ),
         parameters=[
@@ -252,9 +252,10 @@ class QQLikePlugin(MaiBotPlugin):
         if not isinstance(message, dict):
             message = {}
 
-        # -------------------------------------------------------------- #
-        # 用户原话优先修正 AI Tool 的点赞次数
-        # -------------------------------------------------------------- #
+        # AI Tool 路径统一开关语义
+        target = self._normalize_user_id(str(target_qq or ""))
+        if target and not self.config.like.allow_raw_qq:
+            return {"content": "当前配置中禁止直接指定任意 QQ 号点赞。"}
 
         user_text = str(
             message.get("processed_plain_text")
@@ -277,8 +278,6 @@ class QQLikePlugin(MaiBotPlugin):
                     or ""
                 )
             )
-
-        target = self._normalize_user_id(str(target_qq or ""))
 
         if not target:
             target = sender_id
@@ -343,7 +342,6 @@ class QQLikePlugin(MaiBotPlugin):
 
         raw_qq, times = self._parse_args(rest)
 
-        # 对 3-4 位纯数字参数给出明确的 QQ 号格式提示
         if (
             not raw_qq
             and rest.isdigit()
@@ -386,23 +384,23 @@ class QQLikePlugin(MaiBotPlugin):
             sender_id,
         )
 
+        # 解决命令路径可能重复回复的问题
         if ok:
             display = self._display_name(
                 target_id,
                 message,
             )
-
             await self._reply(
                 stream_id,
                 f"已给 {display} 点了 {times} 次赞 ✓",
             )
+            return True, "liked", True
         else:
             await self._reply(
                 stream_id,
                 msg,
             )
-
-        return ok, msg, True
+            return False, "failed", True
 
     # ------------------------------------------------------------------ #
     # 核心点赞逻辑
@@ -428,7 +426,6 @@ class QQLikePlugin(MaiBotPlugin):
         if self_id and target_id == self_id:
             return False, "不能给自己点赞哦。"
 
-        # 次数规范化
         if times <= 0:
             times = self.config.like.default_times
 
@@ -436,14 +433,6 @@ class QQLikePlugin(MaiBotPlugin):
             max(1, times),
             self.config.like.max_times,
         )
-
-        # -------------------------------------------------------------- #
-        # 预占额度
-        #
-        # 注意：
-        # 这里不会立刻把 cooldown 写进持久化 state。
-        # 只有 NapCat 成功后才真正提交。
-        # -------------------------------------------------------------- #
 
         reservation = await self._reserve_like(
             target_id=target_id,
@@ -479,10 +468,6 @@ class QQLikePlugin(MaiBotPlugin):
             )
 
             return False, f"点赞失败：{exc}"
-
-        # -------------------------------------------------------------- #
-        # NapCat 返回明确失败
-        # -------------------------------------------------------------- #
 
         if isinstance(response, dict) and response.get("success") is False:
             detail = str(
@@ -529,10 +514,6 @@ class QQLikePlugin(MaiBotPlugin):
 
             return False, f"点赞失败：{detail or '协议端返回异常'}"
 
-        # -------------------------------------------------------------- #
-        # API 成功：正式提交额度和 cooldown
-        # -------------------------------------------------------------- #
-
         await self._commit_reservation(
             target_id=target_id,
             sender_id=sender_id,
@@ -561,10 +542,6 @@ class QQLikePlugin(MaiBotPlugin):
         async with self._lock:
             self._roll_state_date()
 
-            # ---------------------------------------------------------- #
-            # cooldown 检查
-            # ---------------------------------------------------------- #
-
             cooldown = self.config.like.cooldown_seconds
 
             if cooldown > 0 and sender_id:
@@ -592,10 +569,6 @@ class QQLikePlugin(MaiBotPlugin):
                     wait = int(cooldown - elapsed) + 1
 
                     return f"别急，{wait} 秒后再试吧。"
-
-            # ---------------------------------------------------------- #
-            # 每日额度
-            # ---------------------------------------------------------- #
 
             limit = self.config.like.daily_limit_per_target
 
@@ -633,10 +606,6 @@ class QQLikePlugin(MaiBotPlugin):
                     f"今天已经给 TA 点过 {limit} 次赞啦，"
                     "明天再来吧。"
                 )
-
-            # ---------------------------------------------------------- #
-            # 预占
-            # ---------------------------------------------------------- #
 
             self._pending_target_counts[target_id] = (
                 pending + actual_times
@@ -713,7 +682,6 @@ class QQLikePlugin(MaiBotPlugin):
                     None,
                 )
 
-            # 正式增加每日额度
             current_used = int(
                 self._state["targets"].get(
                     target_id,
@@ -726,7 +694,6 @@ class QQLikePlugin(MaiBotPlugin):
                 current_used + times
             )
 
-            # 正式提交 cooldown
             if sender_id and cooldown > 0:
                 self._state["cooldown"][sender_id] = cooldown
 
@@ -759,12 +726,10 @@ class QQLikePlugin(MaiBotPlugin):
             if not token.isdigit():
                 continue
 
-            # QQ 号
             if 5 <= len(token) <= 12:
                 target = target or token
                 continue
 
-            # 点赞次数
             if 1 <= len(token) <= 2:
                 value = int(token)
 
@@ -793,15 +758,14 @@ class QQLikePlugin(MaiBotPlugin):
             )
             return default
 
-    @staticmethod
     def _extract_times_from_text(
+        self,
         text: str,
     ) -> int | None:
 
         if not text:
             return None
 
-        # 20个赞 / 20 次点赞 / 点20个赞
         patterns = (
             r"(\d+)\s*(?:个|次)?\s*(?:赞|点赞)",
             r"(?:赞|点赞)\s*(\d+)\s*(?:个|次)?",
@@ -821,7 +785,7 @@ class QQLikePlugin(MaiBotPlugin):
                     return None
 
         if "点满" in text or "全部点亮" in text:
-            return 20
+            return self.config.like.max_times
 
         return None
 
@@ -840,7 +804,6 @@ class QQLikePlugin(MaiBotPlugin):
         if not isinstance(segments, list):
             return "", "消息段解析失败。"
 
-        # @目标
         if self.config.like.allow_at_target:
             for seg in segments:
                 if (
@@ -871,7 +834,6 @@ class QQLikePlugin(MaiBotPlugin):
                 ):
                     return uid, ""
 
-        # 回复目标
         if self.config.like.allow_reply_target:
             for seg in segments:
                 if (
@@ -993,7 +955,6 @@ class QQLikePlugin(MaiBotPlugin):
                 "cooldown": {},
             }
 
-            # 跨天时清掉临时预占
             self._pending_target_counts.clear()
             self._pending_cooldowns.clear()
 
@@ -1069,7 +1030,6 @@ class QQLikePlugin(MaiBotPlugin):
                 indent=2,
             )
 
-            # 先写临时文件，再原子替换
             temp_path.write_text(
                 content,
                 encoding="utf-8",
