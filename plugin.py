@@ -17,7 +17,7 @@ from maibot_sdk.types import (
 )
 
 
-SUPPORTED_CONFIG_VERSION = "0.2.3"
+SUPPORTED_CONFIG_VERSION = "0.2.4"
 
 SEND_LIKE_API = "adapter.napcat.account.send_like"
 GET_LOGIN_INFO_API = "adapter.napcat.system.get_login_info"
@@ -106,7 +106,7 @@ class AdminSectionConfig(PluginConfigBase):
     __ui_order__ = 2
 
     admin_only: bool = Field(
-        default=False,
+        default=True,
         description="是否仅允许管理员使用",
     )
 
@@ -296,9 +296,11 @@ class QQLikePlugin(MaiBotPlugin):
                 )
             }
 
+        safe_times = self._coerce_times(times)
+
         ok, msg = await self._perform_like(
             target,
-            int(times or self.config.like.default_times),
+            safe_times,
             sender_id,
         )
 
@@ -340,6 +342,18 @@ class QQLikePlugin(MaiBotPlugin):
         ).strip()
 
         raw_qq, times = self._parse_args(rest)
+
+        # 对 3-4 位纯数字参数给出明确的 QQ 号格式提示
+        if (
+            not raw_qq
+            and rest.isdigit()
+            and 3 <= len(rest) <= 4
+        ):
+            await self._reply(
+                stream_id,
+                "这个 QQ 号太短啦，QQ 号需要是 5-12 位纯数字。",
+            )
+            return False, "QQ 号格式无效", True
 
         self_id = await self._ensure_self_id()
 
@@ -762,6 +776,22 @@ class QQLikePlugin(MaiBotPlugin):
                     )
 
         return target, times
+
+    def _coerce_times(self, value: Any) -> int:
+        """将 LLM 传入的点赞次数安全转换为整数。"""
+        default = self.config.like.default_times
+
+        if value is None or value == "":
+            return default
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            self.ctx.logger.warning(
+                "LLM 点赞次数参数无效，已回退默认值: %r",
+                value,
+            )
+            return default
 
     @staticmethod
     def _extract_times_from_text(
