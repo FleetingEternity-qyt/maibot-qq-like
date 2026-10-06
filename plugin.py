@@ -16,12 +16,13 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "0.2.5"
+SUPPORTED_CONFIG_VERSION = "0.2.6"
 
 SEND_LIKE_API = "adapter.napcat.account.send_like"
 GET_LOGIN_INFO_API = "adapter.napcat.system.get_login_info"
 
-COMMAND_PATTERN = r"(?<!\S)/?(?:点赞|赞|zan)(?:\s+(?P<rest>.+?))?\s*$"
+# 强制要求 / 前缀，防止闲聊误触
+COMMAND_PATTERN = r"(?<!\S)/(?:点赞|赞|zan)(?:\s+(?P<rest>.+?))?\s*$"
 
 STATE_FILE_NAME = "like_state.json"
 
@@ -95,7 +96,7 @@ class LikeSectionConfig(PluginConfigBase):
 
     enable_llm_tool: bool = Field(
         default=True,
-        description="启用 AI 口语化触发（关闭后 AI 将无法主动触发，仅允许命令触发，需重启插件生效）",
+        description="启用 AI 口语化触发（关闭后 AI 将无法主动触发，仅允许命令触发；配置更新后生效）",
     )
 
 
@@ -144,19 +145,14 @@ class QQLikePlugin(MaiBotPlugin):
             "cooldown": {},
         }
 
-        # 保护状态读写以及额度预占
         self._lock = asyncio.Lock()
 
-        # 机器人自身 QQ
         self._self_id: str = ""
 
-        # 获取机器人 QQ 失败后的短暂缓存
         self._self_id_failed_until: float = 0.0
 
-        # 正在执行中的点赞请求
         self._pending_target_counts: dict[str, int] = {}
 
-        # 正在冷却中的用户
         self._pending_cooldowns: dict[str, float] = {}
 
     async def on_load(self) -> None:
@@ -166,7 +162,6 @@ class QQLikePlugin(MaiBotPlugin):
         self._state_path = data_dir / STATE_FILE_NAME
         self._state = self._read_state()
 
-        # 针对默认配置锁死的问题，在加载时给出明确警告
         if self.config.admin.admin_only and not self.config.admin.admins.strip():
             self.ctx.logger.warning(
                 "⚠️ 安全警告：admin_only 已开启，但 admins 列表为空！"
@@ -197,6 +192,11 @@ class QQLikePlugin(MaiBotPlugin):
                 "配置已热更新 version=%s",
                 version,
             )
+
+            if not self.config.like.enable_llm_tool:
+                self.ctx.logger.info(
+                    "LLM 点赞工具已按配置禁用；命令触发仍可正常使用。"
+                )
 
     # ------------------------------------------------------------------ #
     # AI Tool
@@ -233,7 +233,7 @@ class QQLikePlugin(MaiBotPlugin):
                 default=10,
             ),
         ],
-        core_tool=True,
+        core_tool=True,  # 恢复 core_tool，确保 AI 能够直接看到该工具
     )
     async def tool_like_qq_profile(
         self,
@@ -252,7 +252,6 @@ class QQLikePlugin(MaiBotPlugin):
         if not isinstance(message, dict):
             message = {}
 
-        # AI Tool 路径统一开关语义
         target = self._normalize_user_id(str(target_qq or ""))
         if target and not self.config.like.allow_raw_qq:
             return {"content": "当前配置中禁止直接指定任意 QQ 号点赞。"}
@@ -317,10 +316,10 @@ class QQLikePlugin(MaiBotPlugin):
     async def cmd_qq_like(
         self,
         **kwargs: Any,
-    ) -> tuple[bool, str, bool]:
+    ) -> tuple[bool, str | None, bool]:  # 第三位改为 bool，语义更准确
 
         if not self.config.plugin.enabled:
-            return False, "插件未启用", True
+            return False, None, True
 
         stream_id = str(kwargs.get("stream_id") or "")
 
@@ -351,7 +350,7 @@ class QQLikePlugin(MaiBotPlugin):
                 stream_id,
                 "这个 QQ 号太短啦，QQ 号需要是 5-12 位纯数字。",
             )
-            return False, "QQ 号格式无效", True
+            return False, None, True
 
         self_id = await self._ensure_self_id()
 
@@ -367,13 +366,7 @@ class QQLikePlugin(MaiBotPlugin):
             )
 
             if not target_id:
-                await self._reply(
-                    stream_id,
-                    reason
-                    or "没找到点赞目标，用法：/赞 @某人、回复消息发 /赞，或 /赞 QQ号",
-                )
-
-                return False, "无有效目标", True
+                return False, None, True
 
         if times is None:
             times = self.config.like.default_times
@@ -384,23 +377,15 @@ class QQLikePlugin(MaiBotPlugin):
             sender_id,
         )
 
-        # 解决命令路径可能重复回复的问题
+        # 解决次数虚假和重复回复的问题
         if ok:
-            display = self._display_name(
-                target_id,
-                message,
-            )
-            await self._reply(
-                stream_id,
-                f"已给 {display} 点了 {times} 次赞 ✓",
-            )
-            return True, "liked", True
+            display = self._display_name(target_id, message)
+            final_msg = msg.replace(target_id, display)
+            await self._reply(stream_id, final_msg)
+            return True, None, True
         else:
-            await self._reply(
-                stream_id,
-                msg,
-            )
-            return False, "failed", True
+            await self._reply(stream_id, msg)
+            return False, None, True
 
     # ------------------------------------------------------------------ #
     # 核心点赞逻辑
@@ -989,6 +974,7 @@ class QQLikePlugin(MaiBotPlugin):
         if not isinstance(data, dict):
             return blank
 
+        # 跨天清理逻辑：如果发现数据是昨天的，直接返回空白数据
         if data.get("date") != today:
             return blank
 
