@@ -16,10 +16,13 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "0.2.6"
+SUPPORTED_CONFIG_VERSION = "0.2.8"
 
-SEND_LIKE_API = "adapter.napcat.account.send_like"
-GET_LOGIN_INFO_API = "adapter.napcat.system.get_login_info"
+# 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
+# 优先尝试 SnowLuma；若 API 不存在/调用层抛出异常，再尝试 NapCat。
+ADAPTER_NAMESPACES = ("adapter.snowluma", "adapter.napcat")
+SEND_LIKE_API_SUFFIX = ".account.send_like"
+GET_LOGIN_INFO_API_SUFFIX = ".system.get_login_info"
 
 # 强制要求 / 前缀，防止闲聊误触
 COMMAND_PATTERN = r"(?<!\S)/(?:点赞|赞|zan)(?:\s+(?P<rest>.+?))?\s*$"
@@ -148,6 +151,7 @@ class QQLikePlugin(MaiBotPlugin):
         self._lock = asyncio.Lock()
 
         self._self_id: str = ""
+        self._adapter_namespace: str = ""
 
         self._self_id_failed_until: float = 0.0
 
@@ -432,8 +436,8 @@ class QQLikePlugin(MaiBotPlugin):
         reserved_cooldown = reservation["cooldown"]
 
         try:
-            response = await self.ctx.api.call(
-                SEND_LIKE_API,
+            response, api_name = await self._call_adapter_api(
+                SEND_LIKE_API_SUFFIX,
                 params={
                     "user_id": int(target_id),
                     "times": reserved_times,
@@ -447,12 +451,8 @@ class QQLikePlugin(MaiBotPlugin):
                 reserved_times,
             )
 
-            self.ctx.logger.exception(
-                "调用 %s 失败",
-                SEND_LIKE_API,
-            )
-
-            return False, f"点赞失败：{exc}"
+            self.ctx.logger.exception("NapCat/SnowLuma 点赞 API 调用失败")
+            return False, f"点赞失败：未能调用 NapCat/SnowLuma 点赞接口（{exc}）"
 
         if isinstance(response, dict) and response.get("success") is False:
             detail = str(
@@ -468,13 +468,14 @@ class QQLikePlugin(MaiBotPlugin):
             )
 
             self.ctx.logger.warning(
-                "send_like 失败: %s",
+                "%s 失败: %s",
+                api_name,
                 detail,
             )
 
             return False, f"点赞失败：{detail}"
 
-        if not self._is_napcat_ok(response):
+        if not self._is_api_success(response):
             detail = ""
 
             if isinstance(response, dict):
@@ -493,7 +494,8 @@ class QQLikePlugin(MaiBotPlugin):
             )
 
             self.ctx.logger.warning(
-                "send_like 协议端返回异常: %s",
+                "%s 协议端返回异常: %s",
+                api_name,
                 response,
             )
 
@@ -1039,81 +1041,106 @@ class QQLikePlugin(MaiBotPlugin):
     # 机器人自身 QQ
     # ------------------------------------------------------------------ #
 
-    async def _ensure_self_id(self) -> str:
+    async def _call_adapter_api(
+        self,
+        api_suffix: str,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[Any, str]:
+        """调用 SnowLuma 或 NapCat API。
 
+        只有在 API 调用层抛异常（例如对应命名空间不存在）时才尝试另一个
+        命名空间；若接口已返回业务失败结果，则不重复调用，避免重复点赞。
+        """
+        namespaces = list(ADAPTER_NAMESPACES)
+        if self._adapter_namespace in namespaces:
+            namespaces.remove(self._adapter_namespace)
+            namespaces.insert(0, self._adapter_namespace)
+
+        last_error: Exception | None = None
+        for namespace in namespaces:
+            api_name = f"{namespace}{api_suffix}"
+            try:
+                if params is None:
+                    response = await self.ctx.api.call(api_name)
+                else:
+                    response = await self.ctx.api.call(api_name, params=params)
+                self._adapter_namespace = namespace
+                return response, api_name
+            except Exception as exc:
+                last_error = exc
+                self.ctx.logger.debug("适配器 API %s 调用失败，尝试兼容接口：%s", api_name, exc)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("未找到可用的 NapCat/SnowLuma API")
+
+    async def _ensure_self_id(self) -> str:
         if self._self_id:
             return self._self_id
 
         now = time.time()
-
         if now < self._self_id_failed_until:
             return ""
 
-        try:
-            info = await self.ctx.api.call(
-                GET_LOGIN_INFO_API
-            )
+        errors: list[str] = []
+        for namespace in ADAPTER_NAMESPACES:
+            api_name = f"{namespace}{GET_LOGIN_INFO_API_SUFFIX}"
+            try:
+                info = await self.ctx.api.call(api_name)
+            except Exception as exc:
+                errors.append(f"{api_name}: {exc}")
+                continue
 
-        except Exception as exc:
-            self._self_id_failed_until = (
-                now + SELF_ID_FAILURE_CACHE_SECONDS
-            )
-
-            self.ctx.logger.warning(
-                "获取机器人账号失败: %s",
-                exc,
-            )
-
-            return ""
-
-        if isinstance(info, dict):
-
+            if not isinstance(info, dict):
+                continue
             if info.get("success") is False:
-                self._self_id_failed_until = (
-                    now + SELF_ID_FAILURE_CACHE_SECONDS
-                )
+                errors.append(f"{api_name}: {info.get('error') or info.get('message') or '接口返回失败'}")
+                continue
 
-                self.ctx.logger.warning(
-                    "获取机器人账号失败: %s",
-                    info.get("error"),
-                )
-
-                return ""
-
-            uid = (
-                info.get("user_id")
-                or info.get("qq")
-                or info.get("uin")
-            )
-
+            payload: Any = info.get("data") or info.get("result") or info
+            if not isinstance(payload, dict):
+                continue
+            uid = payload.get("user_id") or payload.get("qq") or payload.get("uin")
             if uid:
-                self._self_id = str(uid)
+                self._self_id = self._normalize_user_id(str(uid))
+                self._adapter_namespace = namespace
                 self._self_id_failed_until = 0.0
+                return self._self_id
 
-        if not self._self_id:
-            self._self_id_failed_until = (
-                now + SELF_ID_FAILURE_CACHE_SECONDS
-            )
-
-        return self._self_id
+        self._self_id_failed_until = now + SELF_ID_FAILURE_CACHE_SECONDS
+        if errors:
+            self.ctx.logger.debug("获取机器人账号失败：%s", "；".join(errors))
+        return ""
 
     # ------------------------------------------------------------------ #
     # 工具函数
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _is_napcat_ok(resp: Any) -> bool:
+    def _is_api_success(resp: Any) -> bool:
+        """兼容统一连接器的 success 包装和 OneBot status/retcode 返回。
 
+        未知或空响应不再默认当作成功，避免点赞 API 没有返回有效结果时
+        插件仍然报告“点赞成功”并消耗每日额度。
+        """
         if not isinstance(resp, dict):
+            return False
+
+        if resp.get("success") is False:
+            return False
+        if resp.get("success") is True:
             return True
 
         status = resp.get("status")
         retcode = resp.get("retcode")
 
-        if status is None and retcode is None:
-            return True
+        if status is not None:
+            return status == "ok"
+        if retcode is not None:
+            return retcode == 0
 
-        return status == "ok" or retcode == 0
+        # 部分封装直接返回 data/result；只在存在明确响应载荷时接受。
+        return "data" in resp or "result" in resp
 
     @staticmethod
     def _normalize_user_id(raw: str) -> str:

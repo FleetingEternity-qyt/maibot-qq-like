@@ -1,6 +1,6 @@
 # QQ 名片点赞插件
 
-通过 NapCat 适配器给 QQ 好友名片点赞，支持命令触发和 AI 口语化触发两种方式。
+同时兼容 NapCat 与 SnowLuma 适配器给 QQ 好友名片点赞，支持命令触发和 AI 口语化触发两种方式。
 
 ## 功能
 
@@ -11,7 +11,7 @@
 ## 安装方式
 
 1. 将本插件目录放入 MaiBot 的 `plugins/` 文件夹下
-2. 确保已安装并启用 `maibot-team.napcat-adapter` 适配器插件
+2. 确保已安装并启用 **NapCat 或 SnowLuma** 其中一种适配器。MaiBot 1.3.0 环境推荐使用新版 SnowLuma 统一连接器；旧环境仍可使用 NapCat。
 3. 重启 MaiBot
 4. 在 WebUI `http://127.0.0.1:8001` 插件管理中确认已启用
 
@@ -24,7 +24,7 @@
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | enabled | true | 是否启用插件 |
-| config_version | "0.2.6" | 配置版本（请勿修改） |
+| config_version | "0.2.8" | 配置版本（请勿修改） |
 
 ### [like] 点赞设置
 
@@ -54,11 +54,18 @@
 - `/赞 123456789` → 给指定 QQ 号点赞
 - 群里说“麦麦给我点个赞” → AI 自动触发
 
+## 适配器兼容性
+
+- 同一份插件代码兼容 `maibot-team.napcat-adapter` 与 `maibot-team.snowluma-adapter`，无需安装两种适配器。
+- 插件会尝试调用 `adapter.snowluma.*` 和 `adapter.napcat.*` 下的登录信息及点赞 API，并记住成功使用的命名空间。
+- 只有 API 调用层抛出异常时才切换到另一个命名空间；如果 API 已返回业务失败，不会再次调用另一个接口，避免重复点赞。
+- 插件清单不强制依赖某一种适配器；请自行安装并启用其中一种兼容的适配器。
+
 ## 依赖
 
 - MaiBot >= 1.2.0
 - maibot-plugin-sdk >= 2.5.0
-- `maibot-team.napcat-adapter`
+- `maibot-team.napcat-adapter` 或 `maibot-team.snowluma-adapter`（二选一）
 
 ## 许可证
 
