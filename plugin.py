@@ -16,11 +16,13 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "0.2.8"
+SUPPORTED_CONFIG_VERSION = "0.2.9"
 
 # 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
-# 优先尝试 SnowLuma；若 API 不存在/调用层抛出异常，再尝试 NapCat。
+# 仅在明确确认 API 不存在时切换命名空间；点赞请求出现未知异常时不自动重试，
+# 避免请求已经在 QQ 侧执行但响应丢失时造成重复点赞。
 ADAPTER_NAMESPACES = ("adapter.snowluma", "adapter.napcat")
+ADAPTER_API_VERSION = "1"
 SEND_LIKE_API_SUFFIX = ".account.send_like"
 GET_LOGIN_INFO_API_SUFFIX = ".system.get_login_info"
 
@@ -1048,8 +1050,9 @@ class QQLikePlugin(MaiBotPlugin):
     ) -> tuple[Any, str]:
         """调用 SnowLuma 或 NapCat API。
 
-        只有在 API 调用层抛异常（例如对应命名空间不存在）时才尝试另一个
-        命名空间；若接口已返回业务失败结果，则不重复调用，避免重复点赞。
+        只有在明确确认 API 不存在时才尝试另一个命名空间。对点赞这类
+        有副作用的请求，超时、断连等未知异常不能安全重试，因为请求
+        可能已经在 QQ 侧执行。
         """
         namespaces = list(ADAPTER_NAMESPACES)
         if self._adapter_namespace in namespaces:
@@ -1060,19 +1063,66 @@ class QQLikePlugin(MaiBotPlugin):
         for namespace in namespaces:
             api_name = f"{namespace}{api_suffix}"
             try:
-                if params is None:
-                    response = await self.ctx.api.call(api_name)
-                else:
-                    response = await self.ctx.api.call(api_name, params=params)
+                call_kwargs: dict[str, Any] = {}
+                if namespace == "adapter.snowluma":
+                    call_kwargs["version"] = ADAPTER_API_VERSION
+                if params is not None:
+                    call_kwargs["params"] = params
+                response = await self.ctx.api.call(
+                    api_name,
+                    **call_kwargs,
+                )
                 self._adapter_namespace = namespace
                 return response, api_name
             except Exception as exc:
                 last_error = exc
-                self.ctx.logger.debug("适配器 API %s 调用失败，尝试兼容接口：%s", api_name, exc)
+                if not self._is_missing_api_error(exc):
+                    self.ctx.logger.warning(
+                        "适配器 API %s 调用结果未知，不自动切换命名空间重试：%s",
+                        api_name,
+                        exc,
+                    )
+                    raise
+                self.ctx.logger.debug(
+                    "适配器 API %s 不存在，尝试兼容命名空间：%s",
+                    api_name,
+                    exc,
+                )
 
         if last_error is not None:
             raise last_error
         raise RuntimeError("未找到可用的 NapCat/SnowLuma API")
+
+    @staticmethod
+    def _is_missing_api_error(exc: BaseException) -> bool:
+        """判断异常是否明确表示 API/命名空间不存在。
+
+        网络超时、连接断开和服务端未知错误都不能归类为 API 不存在；
+        这些异常可能发生在请求已经被适配器发送之后。
+        """
+        exception_name = type(exc).__name__.lower()
+        text = str(exc).lower()
+
+        missing_markers = (
+            "api not found",
+            "unknown api",
+            "unknown action",
+            "unknown method",
+            "method not found",
+            "not registered",
+            "unregistered",
+            "unsupported api",
+            "api does not exist",
+            "未找到 api",
+            "api 不存在",
+            "接口不存在",
+            "未注册",
+        )
+
+        return any(
+            marker in exception_name or marker in text
+            for marker in missing_markers
+        )
 
     async def _ensure_self_id(self) -> str:
         if self._self_id:
@@ -1086,7 +1136,13 @@ class QQLikePlugin(MaiBotPlugin):
         for namespace in ADAPTER_NAMESPACES:
             api_name = f"{namespace}{GET_LOGIN_INFO_API_SUFFIX}"
             try:
-                info = await self.ctx.api.call(api_name)
+                call_kwargs: dict[str, Any] = {}
+                if namespace == "adapter.snowluma":
+                    call_kwargs["version"] = ADAPTER_API_VERSION
+                info = await self.ctx.api.call(
+                    api_name,
+                    **call_kwargs,
+                )
             except Exception as exc:
                 errors.append(f"{api_name}: {exc}")
                 continue
