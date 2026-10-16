@@ -16,7 +16,7 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "0.2.9"
+SUPPORTED_CONFIG_VERSION = "0.3.0"
 
 # 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
 # 仅在明确确认 API 不存在时切换命名空间；点赞请求出现未知异常时不自动重试，
