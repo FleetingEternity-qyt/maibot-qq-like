@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
 import math
 import unicodedata
 import uuid
@@ -13,9 +14,11 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import (
     CONFIG_RELOAD_SCOPE_SELF,
+    HookMode,
+    HookOrder,
     ToolParameterInfo,
     ToolParamType,
 )
@@ -35,6 +38,8 @@ GET_LOGIN_INFO_API_SUFFIX = ".system.get_login_info"
 COMMAND_PATTERN = r"/(?:点赞|赞|zan)(?=\s|$)"
 
 STATE_FILE_NAME = "like_state.json"
+SOURCE_TTL_SECONDS = 180
+MAX_SOURCE_MESSAGES = 512
 
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
@@ -103,7 +108,7 @@ class LikeSectionConfig(PluginConfigBase):
 
     enable_llm_tool: bool = Field(
         default=True,
-        description="启用 AI 点赞命令提示；因宿主工具身份来源不可信，AI 不直接执行点赞",
+        description="启用 AI 口语化点赞；发送者从宿主接收的原始请求消息核验",
     )
 
 
@@ -148,6 +153,7 @@ class QQLikePlugin(MaiBotPlugin):
         self._db_path: Path | None = None
         self._storage_error = ""
         self._closed = True
+        self._source_messages: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def on_load(self) -> None:
         try:
@@ -161,11 +167,12 @@ class QQLikePlugin(MaiBotPlugin):
             self._storage_error = "点赞账本读取或迁移失败，请检查数据文件与权限；已暂停发送。"
             self.ctx.logger.exception(self._storage_error)
         self._closed = False
-        self.ctx.logger.info("QQ 点赞插件已加载；AI 工具仅提供命令提示。")
+        self.ctx.logger.info("QQ 点赞插件已加载；AI 口语化点赞按原始请求消息核验身份。")
 
     async def on_unload(self) -> None:
         # 每条请求单独持久化；旧实例卸载不能覆写新实例的账本。
         self._closed = True
+        self._source_messages.clear()
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
@@ -173,10 +180,12 @@ class QQLikePlugin(MaiBotPlugin):
 
     @Tool(
         "like_qq_profile",
-        brief_description="生成 QQ 点赞命令供用户发送确认；本工具不执行点赞，不得声称已点赞。次数省略使用配置默认值，点满请传 use_maximum=true。",
+        brief_description="用户请求给自己或他人 QQ 名片点赞时调用。必须传原始请求的消息编号 source_message_id；无需让用户再发命令。身份、目标和次数由原始消息核验，禁止伪造 user_id。省略次数使用配置默认值，点满传 use_maximum=true。",
         parameters=[
+            ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING,
+                              description="发出本次点赞请求的用户消息编号，从聊天记录的消息 ID 获取，不是被回复或被点赞者的消息 ID", required=True),
             ToolParameterInfo(name="target_qq", param_type=ToolParamType.STRING,
-                              description="目标 QQ 号；省略时提示用户 @目标 或回复目标消息", required=False, default=""),
+                              description="目标 QQ，可省略；填写时必须与原始请求指向一致，给我点赞默认使用原始发言者", required=False, default=""),
             ToolParameterInfo(name="times", param_type=ToolParamType.INTEGER,
                               description="用户指定的次数；0 或省略使用配置默认值，禁止从 QQ 号猜测次数", required=False, default=0),
             ToolParameterInfo(name="use_maximum", param_type=ToolParamType.BOOLEAN,
@@ -185,26 +194,207 @@ class QQLikePlugin(MaiBotPlugin):
         core_tool=True,
         platforms=["qq"],
     )
-    async def tool_like_qq_profile(self, target_qq: str = "", times: int | None = None, use_maximum: bool = False, **kwargs: Any) -> dict[str, Any]:
-        # Host 将模型 arguments 与 context 混合，不能用其中的 user_id/message/platform 鉴权。
+    async def tool_like_qq_profile(self, target_qq: str = "", times: int | None = None, use_maximum: bool = False, source_message_id: str = "", **kwargs: Any) -> dict[str, Any]:
+        # 模型只选择待处理请求，不提供身份；身份和操作范围来自接收 Hook 的快照。
         if not self.config.plugin.enabled or not self.config.like.enable_llm_tool:
             return self._tool_error("点赞工具当前未启用。")
+        if self._closed:
+            return self._tool_error("插件已卸载，未发送点赞。")
         try:
+            request_key, message = self._find_source_request(source_message_id)
+            sender = self._sender_id_from_message(message)
+            if self.config.admin.admin_only and not self._is_admin(sender):
+                raise ValueError("权限不足：原始请求的发送者不是管理员。")
             if type(use_maximum) is not bool:
                 raise ValueError("use_maximum 必须是布尔值。")
-            count = self.config.like.max_times if use_maximum else self._coerce_times(None if type(times) is int and times == 0 else times)
-            if target_qq:
-                if not self.config.like.allow_raw_qq:
-                    raise ValueError("当前配置不允许直接指定 QQ 号，请使用 @ 或回复命令。")
-                target = self._normalize_user_id(target_qq)
-                if not target:
-                    raise ValueError("目标不是有效的 QQ 号。")
-                command = f"/赞 {target} {count}"
-            else:
-                command = f"/赞 @目标 {count}"
-            return self._tool_error(f"尚未执行点赞。请让用户发送命令：{command}；由命令入口核验身份并执行。")
+            text = self._source_text(message)
+            self._validate_oral_request(text)
+            count, maximum = self._oral_times(text)
+            if use_maximum and not maximum:
+                raise ValueError("原始请求没有要求点满，未发送点赞。")
+            if times is not None and not (type(times) is int and times == 0):
+                if self._coerce_times(times) != count:
+                    raise ValueError("工具次数与原始请求不一致，未发送点赞。")
+            account = self._normalize_user_id(message.get("account_id") or "")
+            self_id, _ = await self._get_account(account)
+            target = self._oral_target(message, text, self_id)
+            if target_qq and self._normalize_user_id(target_qq) != target:
+                raise ValueError("工具目标与原始请求不一致，未发送点赞。")
+            ok, reply = await self._perform_like(target, count, sender, expected_account=account,
+                                                request_key=request_key)
+            return {"success": ok, "content": reply, "error": "" if ok else reply}
         except ValueError as exc:
             return self._tool_error(str(exc))
+        except Exception:
+            self.ctx.logger.exception("口语化点赞请求核验失败")
+            return self._tool_error("暂时无法核验原始请求或适配器账号，未发送点赞。")
+
+    @HookHandler("chat.receive.after_process", name="remember_like_source", mode=HookMode.BLOCKING, order=HookOrder.LATE,
+                 description="保存宿主接收的真实 QQ 请求消息，供口语化点赞核验身份")
+    async def remember_like_source(self, message: Any = None, **kwargs: Any) -> dict[str, str]:
+        # 此入口由宿主接收链调用，不接受工具参数补造消息。只缓存小型文本/目标字段。
+        result = {"action": "continue"}
+        if self._closed or not self.config.plugin.enabled or not self.config.like.enable_llm_tool:
+            return result
+        if not isinstance(message, dict) or message.get("platform") != "qq":
+            return result
+        sender = self._sender_id_from_message(message)
+        msg_id, session = message.get("message_id"), message.get("session_id")
+        if not sender or not isinstance(msg_id, str) or not 1 <= len(msg_id) <= 256 or not isinstance(session, str) or not session:
+            return result
+        try:
+            timestamp = float(message.get("timestamp"))
+            if not math.isfinite(timestamp) or not -5 <= time.time() - timestamp <= SOURCE_TTL_SECONDS:
+                return result
+        except (TypeError, ValueError, OverflowError):
+            return result
+        segments = message.get("raw_message")
+        if not isinstance(segments, list) or len(segments) > 64:
+            return result
+        clean, length = [], 0
+        for segment in segments:
+            if not isinstance(segment, dict):
+                return result
+            kind, data = segment.get("type"), segment.get("data")
+            if kind == "text" and isinstance(data, str):
+                length += len(data)
+                if length > 512:
+                    return result
+                clean.append({"type": kind, "data": data})
+            elif kind in {"at", "reply"}:
+                if isinstance(data, (str, int)) and kind == "at":
+                    data = {"qq": data}
+                if not isinstance(data, dict):
+                    return result
+                selected = {key: value for key, value in data.items() if key in {
+                    "target_user_id", "qq", "target_message_sender_id", "target_user_nickname",
+                    "target_user_cardname", "target_message_sender_nickname", "target_message_sender_cardname"
+                } and isinstance(value, (str, int)) and len(str(value)) <= 128}
+                clean.append({"type": kind, "data": selected})
+        if message.get("account_id") and not self._normalize_user_id(message["account_id"]):
+            return result
+        snapshot = {key: message.get(key) for key in ("message_id", "platform", "session_id", "account_id", "scope")}
+        user = message["message_info"]["user_info"]
+        snapshot["message_info"] = {"user_info": {key: value for key, value in user.items()
+            if key in {"user_id", "user_nickname", "user_cardname"} and isinstance(value, (str, int)) and len(str(value)) <= 128}}
+        snapshot["raw_message"] = clean
+        request_key = "oral:" + hashlib.sha256(json.dumps(["qq", snapshot.get("account_id"),
+            snapshot.get("scope"), session, msg_id, sender], ensure_ascii=False).encode()).hexdigest()
+        now = time.monotonic()
+        self._source_messages = {key: value for key, value in self._source_messages.items() if now - value[0] <= SOURCE_TTL_SECONDS}
+        self._source_messages.setdefault(request_key, (now, snapshot))
+        while len(self._source_messages) > MAX_SOURCE_MESSAGES:
+            self._source_messages.pop(next(iter(self._source_messages)))
+        return result
+
+    def _find_source_request(self, msg_id: Any) -> tuple[str, dict[str, Any]]:
+        if not isinstance(msg_id, str) or not msg_id.strip():
+            raise ValueError("缺少原始请求消息编号，请使用聊天记录中发出点赞请求的消息 ID。")
+        now = time.monotonic()
+        candidates = [(key, message) for key, (created, message) in self._source_messages.items()
+                      if now - created <= SOURCE_TTL_SECONDS and message["message_id"] == msg_id.strip()]
+        if len(candidates) != 1:
+            raise ValueError("没有唯一匹配的近期原始请求，或请求已过期；请勿猜测发言者。")
+        return candidates[0]
+
+    @staticmethod
+    def _source_text(message: dict[str, Any]) -> str:
+        return " ".join(segment["data"] for segment in message["raw_message"] if segment["type"] == "text").strip()
+
+    @staticmethod
+    def _validate_oral_request(text: str) -> None:
+        if text.startswith(("/", ">")) or chr(96) in text or re.search(r"(?<!能)不能", text) or any(word in text for word in ("不要", "不用", "别给", "别点", "不必", "取消", "撤销", "示例", "举例", "用法", "测试", "引用", "如果", "假如", "“", "”", '"', "'", "「", "」", "『", "』", "不是", "不想", "别帮", "不给", "不点赞", "不点", "没让", "未让")):
+            raise ValueError("原始消息不是可直接执行的点赞请求，未发送点赞。")
+        if not re.search(r"点赞|点[^\n]{0,20}赞|(?:来|送)[^\n]{0,12}赞|赞我|给[^\n]{0,30}赞|点满", text):
+            raise ValueError("原始消息没有明确的点赞请求，未发送点赞。")
+        if not re.search(r"给|帮|请|求|麻烦|来|送|赞我|点满|点个赞|点一个赞", text):
+            raise ValueError("原始消息没有明确的执行意图，未发送点赞。")
+
+    def _oral_times(self, text: str) -> tuple[int, bool]:
+        values = []
+        number = r"([+-]?[0-9]+(?:[.][0-9]+)?|[零〇一二两三四五六七八九十百]+|[０-９]+|[²³¹]+)"
+        patterns = (r"(?:点|来|送)\s*([^\s,，。！？!?]{1,16}?)\s*(?:个|次)\s*(?:点赞|赞)",
+                    number + r"\s*(?:个|次)\s*(?:点赞|赞)",
+                    r"(?:点赞|赞)\s*([^\s,，。！？!?]{1,16}?)\s*(?:个|次)(?:[啦吧啊!！?？。，\s]|$)",
+                    r"(?:点|来|送)\s*" + number + r"\s*赞",
+                    r"(?:点赞|赞)\s*" + number + r"(?:[啦吧啊!！?？。，\s]|$)")
+        spans = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                if not any(match.start() < end and start < match.end() for start, end in spans):
+                    token = match.group(1)
+                    digits = {char: index for index, char in enumerate("零一二三四五六七八九")}
+                    digits.update({"两": 2, "〇": 0})
+                    if token in digits:
+                        count = digits[token]
+                    elif re.fullmatch(r"[一二两]?十[一二三四五六七八九]?", token):
+                        left, right = token.split("十")
+                        count = digits.get(left, 1) * 10 + digits.get(right, 0)
+                    else:
+                        count = token
+                    values.append(self._coerce_times(count))
+                    spans.append(match.span())
+        if len(values) > 1:
+            raise ValueError("原始请求包含多份次数，请明确一个次数。")
+        maximum = any(word in text for word in ("点满", "赞满", "全部点亮"))
+        if maximum and values and values[0] != self.config.like.max_times:
+            raise ValueError("点满与指定次数冲突，未发送点赞。")
+        return (self.config.like.max_times if maximum else values[0] if values else self._coerce_times(None)), maximum
+
+    def _oral_target(self, message: dict[str, Any], text: str, self_id: str) -> str:
+        ats, replies = [], []
+        for segment in message["raw_message"]:
+            data = segment.get("data")
+            if segment["type"] == "at":
+                uid = self._normalize_user_id(data.get("target_user_id") or data.get("qq"))
+                if uid == self_id:
+                    continue
+                if not uid or not self.config.like.allow_at_target:
+                    raise ValueError("原始请求的 @目标无效或不被配置允许。")
+                ats.append(uid)
+            elif segment["type"] == "reply":
+                replies.append(self._normalize_user_id(data.get("target_message_sender_id")))
+        numbers = re.findall(r"(?:给|帮|为|赞)\s*(?:QQ[:：]?\s*)?([0-9０-９]{5,32})(?=\s|点|赞|来|送|$)", text, re.IGNORECASE)
+        if numbers and not self.config.like.allow_raw_qq:
+            raise ValueError("当前配置不允许原始请求直接指定 QQ 号。")
+        normalized = [self._normalize_user_id(number) for number in numbers]
+        if numbers and not all(normalized):
+            raise ValueError("原始请求指定的 QQ 号无效。")
+        targets = set(ats + normalized)
+        if len(targets) > 1:
+            raise ValueError("原始请求包含多个点赞目标，未发送点赞。")
+        if targets:
+            return targets.pop()
+        if re.search(r"给我|赞我|帮我(?!\s*给)|我(?:也)?(?:要|想要)", text):
+            return self._sender_id_from_message(message)
+        names: dict[str, set[str]] = {}
+        for created, candidate in self._source_messages.values():
+            if (time.monotonic() - created > SOURCE_TTL_SECONDS or
+                any(candidate.get(key) != message.get(key) for key in ("session_id", "account_id", "scope"))):
+                continue
+            user = candidate["message_info"]["user_info"]
+            uid = self._normalize_user_id(user.get("user_id"))
+            for key in ("user_nickname", "user_cardname"):
+                name = user.get(key)
+                if isinstance(name, str) and 2 <= len(name) <= 64 and uid != self_id:
+                    names.setdefault(name, set()).add(uid)
+        matched = {uid for name, ids in names.items() if re.search(r"(?:给|帮|为)\s*" + re.escape(name) + r"\s*(?:点|赞|来|送)", text) for uid in ids}
+        if len(matched) > 1:
+            raise ValueError("昵称对应多个用户，请 @ 明确目标。")
+        if matched:
+            if not self.config.like.allow_raw_qq:
+                raise ValueError("昵称指定目标需启用直接指定 QQ，或使用真实 @。")
+            return matched.pop()
+        pronoun = re.search(r"(?:给|为)(?:他|她|TA|ta|对方)(?:点|赞)", text)
+        if pronoun and not replies:
+            raise ValueError("无法确认他或她指向谁，请 @ 或回复目标消息。")
+        if re.search(r"(?:给|为)\s*[^\s，。！？,!?]+", text) and not re.search(r"给(?:我|个赞|一个赞)", text) and not pronoun:
+            raise ValueError("无法唯一核验原始请求指向的用户，请 @ 明确目标。")
+        if replies:
+            if not self.config.like.allow_reply_target or not all(replies) or len(set(replies)) != 1:
+                raise ValueError("原始请求的回复目标无效或不被配置允许。")
+            return replies[0]
+        return self._sender_id_from_message(message)
 
     @staticmethod
     def _tool_error(message: str) -> dict[str, Any]:
@@ -313,7 +503,7 @@ class QQLikePlugin(MaiBotPlugin):
             raise ValueError(f"点赞次数必须在 1 到 {self.config.like.max_times} 之间。")
         return count
 
-    async def _perform_like(self, target_id: str, times: int, sender_id: str, *, expected_account: str = "") -> tuple[bool, str]:
+    async def _perform_like(self, target_id: str, times: int, sender_id: str, *, expected_account: str = "", request_key: str = "") -> tuple[bool, str]:
         if self._closed or not self.config.plugin.enabled:
             return False, "点赞功能当前未启用。"
         if self._storage_error:
@@ -340,7 +530,7 @@ class QQLikePlugin(MaiBotPlugin):
         if self.config.admin.admin_only and not self._is_admin(sender):
             return False, "权限配置已更新，当前用户无权执行点赞。"
         try:
-            reservation = self._reserve_like(target, sender, times)
+            reservation = self._reserve_like(target, sender, times, request_key=request_key)
         except Exception:
             self.ctx.logger.exception("预占点赞额度失败")
             return False, "点赞账本无法写入，未发送请求，请检查文件和磁盘。"
@@ -451,9 +641,11 @@ class QQLikePlugin(MaiBotPlugin):
                                    (uuid.uuid4().hex, day, target, "", count, 0, "confirmed"))
         connection.executemany("INSERT INTO legacy_cooldowns VALUES (?,?)", cooldowns.items())
 
-    def _reserve_like(self, target: str, sender: str, requested: int) -> tuple[str, int] | str:
+    def _reserve_like(self, target: str, sender: str, requested: int, *, request_key: str = "") -> tuple[str, int] | str:
         connection = self._connect()
         try:
+            if request_key and connection.execute("SELECT 1 FROM requests WHERE id=?", (request_key,)).fetchone():
+                return "这条原始消息已处理或结果待确认，不会重复发送点赞。"
             now, today = time.time(), time.strftime("%Y-%m-%d")
             # 未确认请求跨日继续占额，防止昨天的迟到请求与今天额度叠加。
             used = connection.execute("SELECT COALESCE(SUM(times),0) FROM requests WHERE target=? AND (day>=? OR state!='confirmed')", (target, today)).fetchone()[0]
@@ -468,7 +660,7 @@ class QQLikePlugin(MaiBotPlugin):
             remaining = self.config.like.daily_limit_per_target - used
             if remaining <= 0:
                 return "该目标今日额度已用完或被未确认请求占用，请勿重复触发。"
-            count, request_id = min(requested, remaining, self.config.like.max_times), uuid.uuid4().hex
+            count, request_id = min(requested, remaining, self.config.like.max_times), request_key or uuid.uuid4().hex
             connection.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?)", (request_id, today, target, sender, count, now, "reserved"))
             connection.commit()
             return request_id, count
