@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
+import sqlite3
+import math
+import unicodedata
+import uuid
+from datetime import date
 import json
 import re
 import time
@@ -16,7 +20,7 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "0.3.1"
+SUPPORTED_CONFIG_VERSION = "1.0.0"
 
 # 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
 # 仅在明确确认 API 不存在时切换命名空间；点赞请求出现未知异常时不自动重试，
@@ -26,13 +30,11 @@ ADAPTER_API_VERSION = "1"
 SEND_LIKE_API_SUFFIX = ".account.send_like"
 GET_LOGIN_INFO_API_SUFFIX = ".system.get_login_info"
 
-# 强制要求 / 前缀，防止闲聊误触
-COMMAND_PATTERN = r"(?<!\S)/(?:点赞|赞|zan)(?:\s+(?P<rest>.+?))?\s*$"
+# Host 可在鉴权前 search；入口只做线性、无重叠回溯的筛选。
+# 处理函数随后严格校验本次原始消息的开头，允许宿主在引用渲染后仍路由命令。
+COMMAND_PATTERN = r"/(?:点赞|赞|zan)(?=\s|$)"
 
 STATE_FILE_NAME = "like_state.json"
-
-SELF_ID_FAILURE_CACHE_SECONDS = 10
-
 
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
@@ -101,7 +103,7 @@ class LikeSectionConfig(PluginConfigBase):
 
     enable_llm_tool: bool = Field(
         default=True,
-        description="启用 AI 口语化触发（关闭后 AI 将无法主动触发，仅允许命令触发；配置更新后生效）",
+        description="启用 AI 点赞命令提示；因宿主工具身份来源不可信，AI 不直接执行点赞",
     )
 
 
@@ -136,1141 +138,458 @@ class QQLikeConfig(PluginConfigBase):
     )
 
 
+
 class QQLikePlugin(MaiBotPlugin):
     config_model: ClassVar[type[PluginConfigBase] | None] = QQLikeConfig
 
     def __init__(self) -> None:
         super().__init__()
-
         self._state_path: Path | None = None
-
-        self._state: dict[str, Any] = {
-            "date": "",
-            "targets": {},
-            "cooldown": {},
-        }
-
-        self._lock = asyncio.Lock()
-
-        self._self_id: str = ""
-        self._adapter_namespace: str = ""
-
-        self._self_id_failed_until: float = 0.0
-
-        self._pending_target_counts: dict[str, int] = {}
-
-        self._pending_cooldowns: dict[str, float] = {}
+        self._db_path: Path | None = None
+        self._storage_error = ""
+        self._closed = True
 
     async def on_load(self) -> None:
-        data_dir = Path(self.ctx.paths.data_dir)
-        data_dir.mkdir(parents=True, exist_ok=True)
-
-        self._state_path = data_dir / STATE_FILE_NAME
-        self._state = self._read_state()
-
-        if self.config.admin.admin_only and not self.config.admin.admins.strip():
-            self.ctx.logger.warning(
-                "⚠️ 安全警告：admin_only 已开启，但 admins 列表为空！"
-                "请在 WebUI 插件配置中填入至少一个管理员 QQ 号，否则任何人都无法使用点赞功能。"
-            )
-
-        self.ctx.logger.info(
-            "QQ 名片点赞插件已加载 enabled=%s, llm_tool=%s, admin_only=%s",
-            self.config.plugin.enabled,
-            self.config.like.enable_llm_tool,
-            self.config.admin.admin_only,
-        )
+        try:
+            directory = Path(self.ctx.paths.data_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            self._state_path = directory / STATE_FILE_NAME
+            self._db_path = directory / "like_ledger.sqlite3"
+            self._initialize_ledger()
+            self._storage_error = ""
+        except Exception:
+            self._storage_error = "点赞账本读取或迁移失败，请检查数据文件与权限；已暂停发送。"
+            self.ctx.logger.exception(self._storage_error)
+        self._closed = False
+        self.ctx.logger.info("QQ 点赞插件已加载；AI 工具仅提供命令提示。")
 
     async def on_unload(self) -> None:
-        async with self._lock:
-            self._write_state()
+        # 每条请求单独持久化；旧实例卸载不能覆写新实例的账本。
+        self._closed = True
 
-        self.ctx.logger.info("QQ 名片点赞插件已卸载")
-
-    async def on_config_update(
-        self,
-        scope: str,
-        config_data: dict[str, Any],
-        version: str,
-    ) -> None:
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
-            self.ctx.logger.info(
-                "配置已热更新 version=%s",
-                version,
-            )
-
-            if not self.config.like.enable_llm_tool:
-                self.ctx.logger.info(
-                    "LLM 点赞工具已按配置禁用；命令触发仍可正常使用。"
-                )
-
-    # ------------------------------------------------------------------ #
-    # AI Tool
-    # ------------------------------------------------------------------ #
+            self.ctx.logger.info("QQ 点赞配置已更新 version=%s", version)
 
     @Tool(
         "like_qq_profile",
-        brief_description="给 QQ 用户名片点赞",
-        detailed_description=(
-            "当用户在聊天中请求给某人点赞时，你必须调用此工具。\n"
-            "触发场景：用户说'给我点个赞'、'帮我点赞'、"
-            "'给某某点赞'、'给 123456789 点赞'、'帮我给群友点个赞'。\n"
-            "参数说明：\n"
-            "- target_qq：string，可选。要点赞的 QQ 号。不填则默认给当前发言者点赞。\n"
-            "- times：integer，可选。点赞次数，默认 10，最大 20。\n"
-            "重要：如果用户明确提出点赞次数，例如'点20个赞'、"
-            "'给我来15个赞'，必须准确提取这个数字并填入 times。\n"
-            "如果用户说'点满'或'全部点亮'，则填入最大值。\n"
-            "调用后请用自然口语回复用户。"
-        ),
+        brief_description="生成 QQ 点赞命令供用户发送确认；本工具不执行点赞，不得声称已点赞。次数省略使用配置默认值，点满请传 use_maximum=true。",
         parameters=[
-            ToolParameterInfo(
-                name="target_qq",
-                param_type=ToolParamType.STRING,
-                description="要点赞的 QQ 号，不填则给当前发言者点赞",
-                required=False,
-                default="",
-            ),
-            ToolParameterInfo(
-                name="times",
-                param_type=ToolParamType.INTEGER,
-                description="点赞次数，如果用户明确要求了次数，必须准确传递",
-                required=False,
-                default=10,
-            ),
+            ToolParameterInfo(name="target_qq", param_type=ToolParamType.STRING,
+                              description="目标 QQ 号；省略时提示用户 @目标 或回复目标消息", required=False, default=""),
+            ToolParameterInfo(name="times", param_type=ToolParamType.INTEGER,
+                              description="用户指定的次数；0 或省略使用配置默认值，禁止从 QQ 号猜测次数", required=False, default=0),
+            ToolParameterInfo(name="use_maximum", param_type=ToolParamType.BOOLEAN,
+                              description="用户说点满时设为 true，使用配置中的单次上限", required=False, default=False),
         ],
-        core_tool=True,  # 恢复 core_tool，确保 AI 能够直接看到该工具
+        core_tool=True,
+        platforms=["qq"],
     )
-    async def tool_like_qq_profile(
-        self,
-        target_qq: str = "",
-        times: int = 10,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-
-        if (
-            not self.config.plugin.enabled
-            or not self.config.like.enable_llm_tool
-        ):
-            return {"content": "点赞功能当前未启用。"}
-
-        message = kwargs.get("message") or {}
-        if not isinstance(message, dict):
-            message = {}
-
-        target = self._normalize_user_id(str(target_qq or ""))
-        if target and not self.config.like.allow_raw_qq:
-            return {"content": "当前配置中禁止直接指定任意 QQ 号点赞。"}
-
-        user_text = str(
-            message.get("processed_plain_text")
-            or kwargs.get("text")
-            or ""
-        ).strip()
-
-        extracted_times = self._extract_times_from_text(user_text)
-
-        if extracted_times is not None:
-            times = extracted_times
-
-        sender_id = self._sender_id_from_message(message)
-
-        if not sender_id:
-            sender_id = self._normalize_user_id(
-                str(
-                    kwargs.get("user_id")
-                    or kwargs.get("sender_id")
-                    or ""
-                )
-            )
-
-        if not target:
-            target = sender_id
-
-        if not target:
-            return {
-                "content": "没有识别出要点赞的目标，请让用户说明要赞谁。"
-            }
-
-        if not self._is_valid_qq(target):
-            return {
-                "content": (
-                    f"识别到的目标 '{target}' 不是有效的 QQ 号，"
-                    "请让用户提供正确的 5-12 位纯数字 QQ 号。"
-                )
-            }
-
-        safe_times = self._coerce_times(times)
-
-        ok, msg = await self._perform_like(
-            target,
-            safe_times,
-            sender_id,
-        )
-
-        return {"content": msg}
-
-    # ------------------------------------------------------------------ #
-    # 命令触发
-    # ------------------------------------------------------------------ #
-
-    @Command(
-        "qq_like",
-        description="给 QQ 名片点赞",
-        pattern=COMMAND_PATTERN,
-    )
-    async def cmd_qq_like(
-        self,
-        **kwargs: Any,
-    ) -> tuple[bool, str | None, bool]:  # 第三位改为 bool，语义更准确
-
-        if not self.config.plugin.enabled:
-            return False, None, True
-
-        stream_id = str(kwargs.get("stream_id") or "")
-
-        message = kwargs.get("message") or {}
-        if not isinstance(message, dict):
-            message = {}
-
-        sender_id = self._normalize_user_id(
-            str(kwargs.get("user_id") or "")
-        )
-
-        matched_groups = kwargs.get("matched_groups") or {}
-        if not isinstance(matched_groups, dict):
-            matched_groups = {}
-
-        rest = str(
-            matched_groups.get("rest") or ""
-        ).strip()
-
-        raw_qq, times = self._parse_args(rest)
-
-        if (
-            not raw_qq
-            and rest.isdigit()
-            and 3 <= len(rest) <= 4
-        ):
-            await self._reply(
-                stream_id,
-                "这个 QQ 号太短啦，QQ 号需要是 5-12 位纯数字。",
-            )
-            return False, None, True
-
-        self_id = await self._ensure_self_id()
-
-        target_id = ""
-
-        if raw_qq and self.config.like.allow_raw_qq:
-            target_id = raw_qq
-
-        if not target_id:
-            target_id, reason = self._resolve_target_from_message(
-                message,
-                self_id,
-            )
-
-            if not target_id:
-                return False, None, True
-
-        if times is None:
-            times = self.config.like.default_times
-
-        ok, msg = await self._perform_like(
-            target_id,
-            int(times),
-            sender_id,
-        )
-
-        # 解决次数虚假和重复回复的问题
-        if ok:
-            display = self._display_name(target_id, message)
-            final_msg = msg.replace(target_id, display)
-            await self._reply(stream_id, final_msg)
-            return True, None, True
-        else:
-            await self._reply(stream_id, msg)
-            return False, None, True
-
-    # ------------------------------------------------------------------ #
-    # 核心点赞逻辑
-    # ------------------------------------------------------------------ #
-
-    async def _perform_like(
-        self,
-        target_id: str,
-        times: int,
-        sender_id: str,
-    ) -> tuple[bool, str]:
-
-        target_id = self._normalize_user_id(target_id)
-
-        if not self._is_valid_qq(target_id):
-            return False, "没找到有效的 QQ 点赞目标。"
-
-        if self.config.admin.admin_only and not self._is_admin(sender_id):
-            return False, "权限不足：仅管理员可用。"
-
-        self_id = await self._ensure_self_id()
-
-        if self_id and target_id == self_id:
-            return False, "不能给自己点赞哦。"
-
-        if times <= 0:
-            times = self.config.like.default_times
-
-        times = min(
-            max(1, times),
-            self.config.like.max_times,
-        )
-
-        reservation = await self._reserve_like(
-            target_id=target_id,
-            sender_id=sender_id,
-            requested_times=times,
-        )
-
-        if isinstance(reservation, str):
-            return False, reservation
-
-        reserved_times = reservation["times"]
-        reserved_cooldown = reservation["cooldown"]
-
+    async def tool_like_qq_profile(self, target_qq: str = "", times: int | None = None, use_maximum: bool = False, **kwargs: Any) -> dict[str, Any]:
+        # Host 将模型 arguments 与 context 混合，不能用其中的 user_id/message/platform 鉴权。
+        if not self.config.plugin.enabled or not self.config.like.enable_llm_tool:
+            return self._tool_error("点赞工具当前未启用。")
         try:
-            response, api_name = await self._call_adapter_api(
-                SEND_LIKE_API_SUFFIX,
-                params={
-                    "user_id": int(target_id),
-                    "times": reserved_times,
-                },
-            )
-
-        except Exception as exc:
-            await self._release_reservation(
-                target_id,
-                sender_id,
-                reserved_times,
-            )
-
-            self.ctx.logger.exception("NapCat/SnowLuma 点赞 API 调用失败")
-            return False, f"点赞失败：未能调用 NapCat/SnowLuma 点赞接口（{exc}）"
-
-        if isinstance(response, dict) and response.get("success") is False:
-            detail = str(
-                response.get("error")
-                or response.get("message")
-                or "未知错误"
-            )
-
-            await self._release_reservation(
-                target_id,
-                sender_id,
-                reserved_times,
-            )
-
-            self.ctx.logger.warning(
-                "%s 失败: %s",
-                api_name,
-                detail,
-            )
-
-            return False, f"点赞失败：{detail}"
-
-        if not self._is_api_success(response):
-            detail = ""
-
-            if isinstance(response, dict):
-                detail = str(
-                    response.get("wording")
-                    or response.get("message")
-                    or response.get("error")
-                    or response.get("retcode")
-                    or ""
-                )
-
-            await self._release_reservation(
-                target_id,
-                sender_id,
-                reserved_times,
-            )
-
-            self.ctx.logger.warning(
-                "%s 协议端返回异常: %s",
-                api_name,
-                response,
-            )
-
-            return False, f"点赞失败：{detail or '协议端返回异常'}"
-
-        await self._commit_reservation(
-            target_id=target_id,
-            sender_id=sender_id,
-            times=reserved_times,
-            cooldown=reserved_cooldown,
-        )
-
-        return (
-            True,
-            f"已给 {target_id} 点了 {reserved_times} 次赞",
-        )
-
-    # ------------------------------------------------------------------ #
-    # 额度预占
-    # ------------------------------------------------------------------ #
-
-    async def _reserve_like(
-        self,
-        target_id: str,
-        sender_id: str,
-        requested_times: int,
-    ) -> dict[str, Any] | str:
-
-        now = time.time()
-
-        async with self._lock:
-            self._roll_state_date()
-
-            cooldown = self.config.like.cooldown_seconds
-
-            if cooldown > 0 and sender_id:
-                last_ts = float(
-                    self._state["cooldown"].get(
-                        sender_id,
-                        0.0,
-                    )
-                    or 0.0
-                )
-
-                pending_ts = self._pending_cooldowns.get(
-                    sender_id,
-                    0.0,
-                )
-
-                effective_last_ts = max(
-                    last_ts,
-                    pending_ts,
-                )
-
-                elapsed = now - effective_last_ts
-
-                if elapsed < cooldown:
-                    wait = int(cooldown - elapsed) + 1
-
-                    return f"别急，{wait} 秒后再试吧。"
-
-            limit = self.config.like.daily_limit_per_target
-
-            used = int(
-                self._state["targets"].get(
-                    target_id,
-                    0,
-                )
-                or 0
-            )
-
-            pending = int(
-                self._pending_target_counts.get(
-                    target_id,
-                    0,
-                )
-                or 0
-            )
-
-            remaining = limit - used - pending
-
-            if remaining <= 0:
-                return (
-                    f"今天已经给 TA 点过 {limit} 次赞啦，"
-                    "明天再来吧。"
-                )
-
-            actual_times = min(
-                requested_times,
-                remaining,
-            )
-
-            if actual_times <= 0:
-                return (
-                    f"今天已经给 TA 点过 {limit} 次赞啦，"
-                    "明天再来吧。"
-                )
-
-            self._pending_target_counts[target_id] = (
-                pending + actual_times
-            )
-
-            if cooldown > 0 and sender_id:
-                self._pending_cooldowns[sender_id] = now
-
-            return {
-                "times": actual_times,
-                "cooldown": now if cooldown > 0 and sender_id else 0.0,
-            }
-
-    async def _release_reservation(
-        self,
-        target_id: str,
-        sender_id: str,
-        times: int,
-    ) -> None:
-
-        async with self._lock:
-            current = int(
-                self._pending_target_counts.get(
-                    target_id,
-                    0,
-                )
-                or 0
-            )
-
-            remaining = current - times
-
-            if remaining > 0:
-                self._pending_target_counts[target_id] = remaining
+            if type(use_maximum) is not bool:
+                raise ValueError("use_maximum 必须是布尔值。")
+            count = self.config.like.max_times if use_maximum else self._coerce_times(None if type(times) is int and times == 0 else times)
+            if target_qq:
+                if not self.config.like.allow_raw_qq:
+                    raise ValueError("当前配置不允许直接指定 QQ 号，请使用 @ 或回复命令。")
+                target = self._normalize_user_id(target_qq)
+                if not target:
+                    raise ValueError("目标不是有效的 QQ 号。")
+                command = f"/赞 {target} {count}"
             else:
-                self._pending_target_counts.pop(
-                    target_id,
-                    None,
-                )
+                command = f"/赞 @目标 {count}"
+            return self._tool_error(f"尚未执行点赞。请让用户发送命令：{command}；由命令入口核验身份并执行。")
+        except ValueError as exc:
+            return self._tool_error(str(exc))
 
-            if sender_id:
-                self._pending_cooldowns.pop(
-                    sender_id,
-                    None,
-                )
+    @staticmethod
+    def _tool_error(message: str) -> dict[str, Any]:
+        return {"success": False, "content": message, "error": message}
 
-    async def _commit_reservation(
-        self,
-        target_id: str,
-        sender_id: str,
-        times: int,
-        cooldown: float,
-    ) -> None:
+    @Command("qq_like", description="给 QQ 名片点赞", pattern=COMMAND_PATTERN, platforms=["qq"])
+    async def cmd_qq_like(self, **kwargs: Any) -> tuple[bool, str | None, bool]:
+        if not self.config.plugin.enabled or self._closed:
+            return False, None, True
+        stream = str(kwargs.get("stream_id") or "")
+        message = kwargs.get("message")
+        if not isinstance(message, dict):
+            return False, None, True
+        try:
+            parsed = self._parse_message(message)
+            if parsed is None:
+                return False, None, True
+            platform = str(message.get("platform") or kwargs.get("platform") or "").lower()
+            if platform != "qq" or (kwargs.get("platform") and str(kwargs["platform"]).lower() != "qq"):
+                raise ValueError("本插件仅支持 QQ 平台。")
+            sender = self._sender_id_from_message(message)
+            supplied = self._normalize_user_id(kwargs.get("user_id", ""))
+            if not sender or (kwargs.get("user_id") and supplied != sender):
+                raise ValueError("无法核验本次命令的发送者。")
+            target, count = parsed
+            account = message.get("account_id") or ""
+            if account and not self._normalize_user_id(account):
+                raise ValueError("无法核验消息所属的机器人账号。")
+            ok, reply = await self._perform_like(target, count, sender, expected_account=account)
+        except ValueError as exc:
+            ok, reply = False, str(exc)
+        await self._reply(stream, reply)
+        return ok, None, True
 
-        async with self._lock:
-            self._roll_state_date()
-
-            current_pending = int(
-                self._pending_target_counts.get(
-                    target_id,
-                    0,
-                )
-                or 0
-            )
-
-            remaining_pending = current_pending - times
-
-            if remaining_pending > 0:
-                self._pending_target_counts[target_id] = (
-                    remaining_pending
-                )
+    def _parse_message(self, message: dict[str, Any]) -> tuple[str, int] | None:
+        segments = message.get("raw_message")
+        if not isinstance(segments, list) or len(segments) > 64:
+            raise ValueError("消息段无效或过长。")
+        texts, ats, replies = [], [], []
+        size = 0
+        unsupported = False
+        for segment in segments:
+            if not isinstance(segment, dict):
+                raise ValueError("消息段无效。")
+            kind, data = segment.get("type"), segment.get("data")
+            if kind == "text":
+                if not isinstance(data, str):
+                    raise ValueError("消息文本无效。")
+                size += len(data)
+                if size > 512:
+                    raise ValueError("点赞命令过长，最多允许 512 个字符。")
+                texts.append(data)
+            elif kind == "at":
+                uid = (data.get("target_user_id") or data.get("qq")) if isinstance(data, dict) else data
+                ats.append(self._normalize_user_id(uid))
+                texts.append(" @ ")
+            elif kind == "reply":
+                replies.append(self._normalize_user_id(data.get("target_message_sender_id")) if isinstance(data, dict) else "")
             else:
-                self._pending_target_counts.pop(
-                    target_id,
-                    None,
-                )
-
-            current_used = int(
-                self._state["targets"].get(
-                    target_id,
-                    0,
-                )
-                or 0
-            )
-
-            self._state["targets"][target_id] = (
-                current_used + times
-            )
-
-            if sender_id and cooldown > 0:
-                self._state["cooldown"][sender_id] = cooldown
-
-                self._pending_cooldowns.pop(
-                    sender_id,
-                    None,
-                )
-
-            self._write_state()
-
-    # ------------------------------------------------------------------ #
-    # 参数解析
-    # ------------------------------------------------------------------ #
-
-    def _parse_args(
-        self,
-        rest: str,
-    ) -> tuple[str, int | None]:
-
-        target = ""
-        times: int | None = None
-
-        for token in re.split(
-            r"[\s,，、]+",
-            rest.strip(),
-        ):
-            if not token:
+                unsupported = True
+        raw = "".join(texts).strip()
+        # 仅匹配本次原始文本开头；不读取引用内容、昵称和 processed_plain_text。
+        match = re.match(r"^/(?:点赞|赞|zan)(?=\s|$)", raw)
+        if not match:
+            return None
+        if unsupported:
+            raise ValueError("点赞命令不能混入图片、转发等消息段。")
+        rest = raw[match.end():].strip()
+        tokens = re.split(r"[\s,，、]+", rest) if rest else []
+        if tokens.count("@") != len(ats):
+            raise ValueError("请使用真实的 @消息段指定目标。")
+        raw_targets, counts = [], []
+        for token in tokens:
+            if token == "@":
                 continue
-
-            if not token.isdigit():
-                continue
-
-            if 5 <= len(token) <= 12:
-                target = target or token
-                continue
-
-            if 1 <= len(token) <= 2:
-                value = int(token)
-
-                if 1 <= value <= self.config.like.max_times:
-                    times = (
-                        times
-                        if times is not None
-                        else value
-                    )
-
-        return target, times
+            normalized = self._normalize_user_id(token)
+            if normalized:
+                raw_targets.append(normalized)
+            else:
+                counts.append(self._coerce_times(token))
+        if len(counts) > 1:
+            raise ValueError("请只指定一次点赞次数。")
+        if raw_targets and not self.config.like.allow_raw_qq:
+            raise ValueError("当前配置禁止直接输入 QQ 号。")
+        if ats and (not self.config.like.allow_at_target or not all(ats)):
+            raise ValueError("@目标无效或当前配置禁止 @ 指定目标。")
+        targets = set(raw_targets + ats)
+        if len(targets) > 1:
+            raise ValueError("一次命令只能指定一个点赞目标。")
+        if not targets:
+            if not replies or not self.config.like.allow_reply_target or not all(replies) or len(set(replies)) != 1:
+                raise ValueError("请通过 @、回复消息或 QQ 号明确指定一个目标。")
+            targets = set(replies)
+        return targets.pop(), counts[0] if counts else self._coerce_times(None)
 
     def _coerce_times(self, value: Any) -> int:
-        """将 LLM 传入的点赞次数安全转换为整数。"""
-        default = self.config.like.default_times
+        if value is None:
+            return min(self.config.like.default_times, self.config.like.max_times)
+        if type(value) is int:
+            count = value
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]{1,2}", value):
+            count = int(value)
+        else:
+            raise ValueError("点赞次数必须是整数，不能含小数、负号或其他文字。")
+        if not 1 <= count <= self.config.like.max_times:
+            raise ValueError(f"点赞次数必须在 1 到 {self.config.like.max_times} 之间。")
+        return count
 
-        if value is None or value == "":
-            return default
-
+    async def _perform_like(self, target_id: str, times: int, sender_id: str, *, expected_account: str = "") -> tuple[bool, str]:
+        if self._closed or not self.config.plugin.enabled:
+            return False, "点赞功能当前未启用。"
+        if self._storage_error:
+            return False, self._storage_error
+        target, sender = self._normalize_user_id(target_id), self._normalize_user_id(sender_id)
+        if not target or not sender:
+            return False, "目标或发送者 QQ 无效。"
+        if self.config.admin.admin_only and not self._is_admin(sender):
+            return False, "权限不足：仅管理员可用。"
         try:
-            return int(value)
-        except (TypeError, ValueError):
-            self.ctx.logger.warning(
-                "LLM 点赞次数参数无效，已回退默认值: %r",
-                value,
-            )
-            return default
-
-    def _extract_times_from_text(
-        self,
-        text: str,
-    ) -> int | None:
-
-        if not text:
-            return None
-
-        patterns = (
-            r"(\d+)\s*(?:个|次)?\s*(?:赞|点赞)",
-            r"(?:赞|点赞)\s*(\d+)\s*(?:个|次)?",
-        )
-
-        for pattern in patterns:
-            match = re.search(
-                pattern,
-                text,
-                flags=re.IGNORECASE,
-            )
-
-            if match:
-                try:
-                    return int(match.group(1))
-                except (TypeError, ValueError):
-                    return None
-
-        if "点满" in text or "全部点亮" in text:
-            return self.config.like.max_times
-
-        return None
-
-    # ------------------------------------------------------------------ #
-    # 目标识别
-    # ------------------------------------------------------------------ #
-
-    def _resolve_target_from_message(
-        self,
-        message: dict[str, Any],
-        self_id: str,
-    ) -> tuple[str, str]:
-
-        segments = message.get("raw_message") or []
-
-        if not isinstance(segments, list):
-            return "", "消息段解析失败。"
-
-        if self.config.like.allow_at_target:
-            for seg in segments:
-                if (
-                    not isinstance(seg, dict)
-                    or seg.get("type") != "at"
-                ):
-                    continue
-
-                data = seg.get("data")
-
-                if isinstance(data, dict):
-                    uid = (
-                        data.get("target_user_id")
-                        or data.get("qq")
-                    )
-                else:
-                    uid = data
-
-                uid = self._normalize_user_id(
-                    str(uid or "")
-                )
-
-                if (
-                    uid
-                    and uid != "all"
-                    and uid != self_id
-                    and self._is_valid_qq(uid)
-                ):
-                    return uid, ""
-
-        if self.config.like.allow_reply_target:
-            for seg in segments:
-                if (
-                    not isinstance(seg, dict)
-                    or seg.get("type") != "reply"
-                ):
-                    continue
-
-                data = seg.get("data")
-
-                if not isinstance(data, dict):
-                    continue
-
-                uid = self._normalize_user_id(
-                    str(
-                        data.get(
-                            "target_message_sender_id"
-                        )
-                        or ""
-                    )
-                )
-
-                if (
-                    uid
-                    and uid != self_id
-                    and self._is_valid_qq(uid)
-                ):
-                    return uid, ""
-
-        return "", ""
-
-    # ------------------------------------------------------------------ #
-    # 消息信息
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _sender_id_from_message(
-        message: dict[str, Any],
-    ) -> str:
-
-        info = message.get("message_info") or {}
-
-        if isinstance(info, dict):
-            user = info.get("user_info") or {}
-
-            if isinstance(user, dict):
-                uid = user.get("user_id")
-
-                if uid:
-                    return QQLikePlugin._normalize_user_id(
-                        str(uid)
-                    )
-
-        uid = message.get("user_id")
-
-        if uid:
-            return QQLikePlugin._normalize_user_id(
-                str(uid)
-            )
-
-        return ""
-
-    @staticmethod
-    def _display_name(
-        target_id: str,
-        message: dict[str, Any],
-    ) -> str:
-
-        segments = message.get("raw_message") or []
-
-        if isinstance(segments, list):
-            for seg in segments:
-                if not isinstance(seg, dict):
-                    continue
-
-                if seg.get("type") not in (
-                    "at",
-                    "reply",
-                ):
-                    continue
-
-                data = seg.get("data")
-
-                if not isinstance(data, dict):
-                    continue
-
-                uid = (
-                    data.get("target_user_id")
-                    or data.get("target_message_sender_id")
-                    or data.get("qq")
-                )
-
-                if str(uid or "") != target_id:
-                    continue
-
-                name = (
-                    data.get("target_user_nickname")
-                    or data.get(
-                        "target_message_sender_nickname"
-                    )
-                )
-
-                if name:
-                    return str(name)
-
-        return target_id
-
-    # ------------------------------------------------------------------ #
-    # 状态管理
-    # ------------------------------------------------------------------ #
-
-    def _roll_state_date(self) -> None:
-        today = time.strftime("%Y-%m-%d")
-
-        if self._state.get("date") != today:
-            self._state = {
-                "date": today,
-                "targets": {},
-                "cooldown": {},
-            }
-
-            self._pending_target_counts.clear()
-            self._pending_cooldowns.clear()
-
-    def _read_state(self) -> dict[str, Any]:
-
-        today = time.strftime("%Y-%m-%d")
-
-        blank: dict[str, Any] = {
-            "date": today,
-            "targets": {},
-            "cooldown": {},
-        }
-
-        path = self._state_path
-
-        if path is None or not path.exists():
-            return blank
-
+            times = self._coerce_times(times)
+        except ValueError as exc:
+            return False, str(exc)
         try:
-            data = json.loads(
-                path.read_text(
-                    encoding="utf-8"
-                )
-            )
-        except Exception as exc:
-            self.ctx.logger.warning(
-                "点赞状态读取失败，已重置: %s",
-                exc,
-            )
-            return blank
+            # 每次重新查询，无永久 self_id 缓存。登录信息与发送使用同一命名空间。
+            self_id, namespace = await self._get_account(self._normalize_user_id(expected_account))
+        except Exception:
+            self.ctx.logger.exception("获取机器人 QQ 失败")
+            return False, "无法确认机器人当前账号，已停止点赞，请检查适配器连接。"
+        if target == self_id:
+            return False, "不能给机器人自己点赞。"
+        if self._closed or not self.config.plugin.enabled:
+            return False, "插件已停用或正在卸载，未发送点赞。"
+        if self.config.admin.admin_only and not self._is_admin(sender):
+            return False, "权限配置已更新，当前用户无权执行点赞。"
+        try:
+            reservation = self._reserve_like(target, sender, times)
+        except Exception:
+            self.ctx.logger.exception("预占点赞额度失败")
+            return False, "点赞账本无法写入，未发送请求，请检查文件和磁盘。"
+        if isinstance(reservation, str):
+            return False, reservation
+        request_id, count = reservation
+        try:
+            response = await self._api(namespace, SEND_LIKE_API_SUFFIX, {"user_id": int(target), "times": count})
+        except BaseException as exc:
+            # 包括取消：已落盘 reserved 记录仍占额度，重启后也不会重发。
+            self._finish_request(request_id, "unknown")
+            if not isinstance(exc, Exception):
+                raise
+            self.ctx.logger.warning("点赞请求结果未确认 request=%s: %s", request_id, exc)
+            return False, "点赞结果未确认，已保留本次额度以防重复；请勿重复触发。"
+        if not self._is_api_success(response):
+            self._finish_request(request_id, "unknown")
+            self.ctx.logger.warning("点赞未确认 request=%s target=%s response=%r", request_id, target, response)
+            return False, "适配器未确认点赞成功，已保留本次额度以防重复；请检查适配器日志。"
+        stored = self._finish_request(request_id, "confirmed")
+        if not stored:
+            return False, "适配器返回成功，但账本确认写入失败；原预占额度仍保留，请勿重复触发。"
+        self.ctx.logger.info("点赞请求已确认 request=%s target=%s times=%s", request_id, target, count)
+        return True, f"已向 QQ 提交给 {target} 点赞 {count} 次的请求（实际到账以 QQ 为准）。"
 
-        if not isinstance(data, dict):
-            return blank
+    def _connect(self) -> sqlite3.Connection:
+        if self._db_path is None:
+            raise RuntimeError("账本尚未初始化")
+        connection = sqlite3.connect(self._db_path, timeout=2, isolation_level=None)
+        try:
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
 
-        # 跨天清理逻辑：如果发现数据是昨天的，直接返回空白数据
-        if data.get("date") != today:
-            return blank
+    def _initialize_ledger(self) -> None:
+        connection = self._connect()
+        try:
+            if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("账本完整性检查失败")
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if tables and tables != {"metadata", "requests", "legacy_cooldowns"}:
+                raise ValueError("账本表结构缺失或不受支持，不能按空额度重建")
+            connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("""CREATE TABLE IF NOT EXISTS requests (
+                id TEXT PRIMARY KEY, day TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL,
+                times INTEGER NOT NULL CHECK(typeof(times)='integer' AND times>0),
+                created REAL NOT NULL CHECK(created>=0),
+                state TEXT NOT NULL CHECK(state IN ('reserved','confirmed','unknown'))
+            )""")
+            connection.execute("CREATE INDEX IF NOT EXISTS request_target ON requests(target)")
+            connection.execute("CREATE INDEX IF NOT EXISTS request_sender ON requests(sender)")
+            connection.execute("CREATE TABLE IF NOT EXISTS legacy_cooldowns (sender TEXT PRIMARY KEY, created REAL NOT NULL)")
+            version = connection.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
+            if version is None:
+                if connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0]:
+                    raise ValueError("账本缺少版本信息")
+                self._migrate_legacy(connection)
+                connection.execute("INSERT INTO metadata VALUES ('schema', '1')")
+            elif version != ("1",):
+                raise ValueError("不支持的账本版本")
+            for _, day, target, sender, count, created, state in connection.execute("SELECT * FROM requests"):
+                parsed_day = date.fromisoformat(day)
+                if (parsed_day.isoformat() != day or self._normalize_user_id(target) != target or not target or
+                    (sender and self._normalize_user_id(sender) != sender) or
+                    type(count) is not int or count < 1 or not math.isfinite(created) or created < 0 or
+                    state not in {"reserved", "confirmed", "unknown"}):
+                    raise ValueError("账本内容无效")
+            for sender, created in connection.execute("SELECT sender,created FROM legacy_cooldowns"):
+                if (not sender or self._normalize_user_id(sender) != sender or
+                    type(created) not in (int, float) or not math.isfinite(created) or created < 0):
+                    raise ValueError("账本冷却记录无效")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
-        targets = data.get("targets")
-        cooldown = data.get("cooldown")
-
-        if not isinstance(targets, dict):
-            targets = {}
-
-        if not isinstance(cooldown, dict):
-            cooldown = {}
-
-        return {
-            "date": today,
-            "targets": targets,
-            "cooldown": cooldown,
-        }
-
-    def _write_state(self) -> None:
-
-        path = self._state_path
-
-        if path is None:
+    def _migrate_legacy(self, connection: sqlite3.Connection) -> None:
+        if self._state_path is None or not self._state_path.exists():
             return
+        data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("date"), str):
+            raise ValueError("旧状态格式无效")
+        day = data["date"]
+        if date.fromisoformat(day).isoformat() != day:
+            raise ValueError("旧状态日期无效")
+        if not isinstance(data.get("targets"), dict) or not isinstance(data.get("cooldown"), dict):
+            raise ValueError("旧状态格式无效")
+        targets, cooldowns = {}, {}
+        for key, count in data["targets"].items():
+            target = self._normalize_user_id(key)
+            if not target or type(count) is not int or count < 0:
+                raise ValueError("旧额度记录无效")
+            targets[target] = targets.get(target, 0) + count
+        for key, timestamp in data["cooldown"].items():
+            sender = self._normalize_user_id(key)
+            if not sender or type(timestamp) not in (int, float) or not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError("旧冷却记录无效")
+            cooldowns[sender] = max(cooldowns.get(sender, 0), timestamp)
+        # 别名额度累加、冷却取最晚值；旧 JSON 原样保留，迁移只发生一次。
+        for target, count in targets.items():
+            if count:
+                connection.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?)",
+                                   (uuid.uuid4().hex, day, target, "", count, 0, "confirmed"))
+        connection.executemany("INSERT INTO legacy_cooldowns VALUES (?,?)", cooldowns.items())
 
-        temp_path = path.with_suffix(
-            path.suffix + ".tmp"
-        )
-
+    def _reserve_like(self, target: str, sender: str, requested: int) -> tuple[str, int] | str:
+        connection = self._connect()
         try:
-            path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            now, today = time.time(), time.strftime("%Y-%m-%d")
+            # 未确认请求跨日继续占额，防止昨天的迟到请求与今天额度叠加。
+            used = connection.execute("SELECT COALESCE(SUM(times),0) FROM requests WHERE target=? AND (day>=? OR state!='confirmed')", (target, today)).fetchone()[0]
+            last = connection.execute("SELECT COALESCE(MAX(created),0) FROM requests WHERE sender=?", (sender,)).fetchone()[0]
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='legacy_cooldowns'").fetchone():
+                row = connection.execute("SELECT created FROM legacy_cooldowns WHERE sender=?", (sender,)).fetchone()
+                if row:
+                    last = max(last, row[0])
+            cooldown = self.config.like.cooldown_seconds
+            if cooldown and now - last < cooldown:
+                return f"别急，{math.ceil(cooldown - (now - last))} 秒后再试吧。"
+            remaining = self.config.like.daily_limit_per_target - used
+            if remaining <= 0:
+                return "该目标今日额度已用完或被未确认请求占用，请勿重复触发。"
+            count, request_id = min(requested, remaining, self.config.like.max_times), uuid.uuid4().hex
+            connection.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?)", (request_id, today, target, sender, count, now, "reserved"))
+            connection.commit()
+            return request_id, count
+        finally:
+            # 失败或提前返回时回滚；绝不能先发请求再尝试落盘。
+            connection.close()
 
-            content = json.dumps(
-                self._state,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-            temp_path.write_text(
-                content,
-                encoding="utf-8",
-            )
-
-            temp_path.replace(path)
-
-        except Exception as exc:
-            self.ctx.logger.warning(
-                "点赞状态写入失败: %s",
-                exc,
-            )
-
+    def _finish_request(self, request_id: str, state: str) -> bool:
+        try:
+            connection = self._connect()
             try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------ #
-    # 机器人自身 QQ
-    # ------------------------------------------------------------------ #
-
-    async def _call_adapter_api(
-        self,
-        api_suffix: str,
-        params: dict[str, Any] | None = None,
-    ) -> tuple[Any, str]:
-        """调用 SnowLuma 或 NapCat API。
-
-        只有在明确确认 API 不存在时才尝试另一个命名空间。对点赞这类
-        有副作用的请求，超时、断连等未知异常不能安全重试，因为请求
-        可能已经在 QQ 侧执行。
-        """
-        namespaces = list(ADAPTER_NAMESPACES)
-        if self._adapter_namespace in namespaces:
-            namespaces.remove(self._adapter_namespace)
-            namespaces.insert(0, self._adapter_namespace)
-
-        last_error: Exception | None = None
-        for namespace in namespaces:
-            api_name = f"{namespace}{api_suffix}"
-            try:
-                call_kwargs: dict[str, Any] = {}
-                if namespace == "adapter.snowluma":
-                    call_kwargs["version"] = ADAPTER_API_VERSION
-                if params is not None:
-                    call_kwargs["params"] = params
-                response = await self.ctx.api.call(
-                    api_name,
-                    **call_kwargs,
-                )
-                self._adapter_namespace = namespace
-                return response, api_name
-            except Exception as exc:
-                last_error = exc
-                if not self._is_missing_api_error(exc):
-                    self.ctx.logger.warning(
-                        "适配器 API %s 调用结果未知，不自动切换命名空间重试：%s",
-                        api_name,
-                        exc,
-                    )
-                    raise
-                self.ctx.logger.debug(
-                    "适配器 API %s 不存在，尝试兼容命名空间：%s",
-                    api_name,
-                    exc,
-                )
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("未找到可用的 NapCat/SnowLuma API")
-
-    @staticmethod
-    def _is_missing_api_error(exc: BaseException) -> bool:
-        """判断异常是否明确表示 API/命名空间不存在。
-
-        网络超时、连接断开和服务端未知错误都不能归类为 API 不存在；
-        这些异常可能发生在请求已经被适配器发送之后。
-        """
-        exception_name = type(exc).__name__.lower()
-        text = str(exc).lower()
-
-        missing_markers = (
-            "api not found",
-            "unknown api",
-            "unknown action",
-            "unknown method",
-            "method not found",
-            "not registered",
-            "unregistered",
-            "unsupported api",
-            "api does not exist",
-            "未找到 api",
-            "api 不存在",
-            "接口不存在",
-            "未注册",
-        )
-
-        return any(
-            marker in exception_name or marker in text
-            for marker in missing_markers
-        )
-
-    async def _ensure_self_id(self) -> str:
-        if self._self_id:
-            return self._self_id
-
-        now = time.time()
-        if now < self._self_id_failed_until:
-            return ""
-
-        errors: list[str] = []
-        for namespace in ADAPTER_NAMESPACES:
-            api_name = f"{namespace}{GET_LOGIN_INFO_API_SUFFIX}"
-            try:
-                call_kwargs: dict[str, Any] = {}
-                if namespace == "adapter.snowluma":
-                    call_kwargs["version"] = ADAPTER_API_VERSION
-                info = await self.ctx.api.call(
-                    api_name,
-                    **call_kwargs,
-                )
-            except Exception as exc:
-                errors.append(f"{api_name}: {exc}")
-                continue
-
-            if not isinstance(info, dict):
-                continue
-            if info.get("success") is False:
-                errors.append(f"{api_name}: {info.get('error') or info.get('message') or '接口返回失败'}")
-                continue
-
-            payload: Any = info.get("data") or info.get("result") or info
-            if not isinstance(payload, dict):
-                continue
-            uid = payload.get("user_id") or payload.get("qq") or payload.get("uin")
-            if uid:
-                self._self_id = self._normalize_user_id(str(uid))
-                self._adapter_namespace = namespace
-                self._self_id_failed_until = 0.0
-                return self._self_id
-
-        self._self_id_failed_until = now + SELF_ID_FAILURE_CACHE_SECONDS
-        if errors:
-            self.ctx.logger.debug("获取机器人账号失败：%s", "；".join(errors))
-        return ""
-
-    # ------------------------------------------------------------------ #
-    # 工具函数
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _is_api_success(resp: Any) -> bool:
-        """兼容统一连接器的 success 包装和 OneBot status/retcode 返回。
-
-        未知或空响应不再默认当作成功，避免点赞 API 没有返回有效结果时
-        插件仍然报告“点赞成功”并消耗每日额度。
-        """
-        if not isinstance(resp, dict):
-            return False
-
-        if resp.get("success") is False:
-            return False
-        if resp.get("success") is True:
+                # 迟到的成功计入完成当天，不能释放当天已被旧请求占用的额度。
+                changed = connection.execute("UPDATE requests SET state=?, day=MAX(day,?) WHERE id=? AND state='reserved'",
+                                             (state, time.strftime("%Y-%m-%d"), request_id)).rowcount
+                if changed != 1:
+                    raise ValueError("请求预占记录不存在或已结算")
+                connection.commit()
+            finally:
+                connection.close()
             return True
-
-        status = resp.get("status")
-        retcode = resp.get("retcode")
-
-        if status is not None:
-            return status == "ok"
-        if retcode is not None:
-            return retcode == 0
-
-        # 部分封装直接返回 data/result；只在存在明确响应载荷时接受。
-        return "data" in resp or "result" in resp
-
-    @staticmethod
-    def _normalize_user_id(raw: str) -> str:
-
-        value = (raw or "").strip()
-
-        if not value:
-            return ""
-
-        if ":" in value:
-            value = value.rsplit(":", 1)[-1]
-
-        return value.strip()
-
-    @staticmethod
-    def _is_valid_qq(value: str) -> bool:
-
-        return bool(
-            re.fullmatch(
-                r"\d{5,12}",
-                value or "",
-            )
-        )
-
-    def _is_admin(
-        self,
-        user_id: str,
-    ) -> bool:
-
-        if not user_id:
+        except Exception:
+            self.ctx.logger.exception("点赞账本结算失败 request=%s", request_id)
             return False
 
-        raw = self.config.admin.admins or ""
+    async def _api(self, namespace: str, suffix: str, params: dict[str, Any] | None = None) -> Any:
+        options: dict[str, Any] = {}
+        if namespace == "adapter.snowluma":
+            options["version"] = ADAPTER_API_VERSION
+        if params is not None:
+            options["params"] = params
+        return await self.ctx.api.call(namespace + suffix, **options)
 
-        tokens = [
-            token
-            for token in re.split(
-                r"[\s,，;；]+",
-                raw,
-            )
-            if token
-        ]
+    async def _get_account(self, expected_account: str = "") -> tuple[str, str]:
+        for namespace in ADAPTER_NAMESPACES:
+            version = ADAPTER_API_VERSION if namespace == "adapter.snowluma" else ""
+            # 先查询无副作用的 API 元信息，缺少登录或点赞接口时直接检查下一种适配器。
+            available = True
+            for suffix in (GET_LOGIN_INFO_API_SUFFIX, SEND_LIKE_API_SUFFIX):
+                metadata = await self.ctx.api.get(namespace + suffix, version=version)
+                if metadata is None:
+                    available = False
+                    break
+                if not isinstance(metadata, dict) or not metadata or metadata.get("success") is False:
+                    raise RuntimeError("无法发现适配器接口")
+            if not available:
+                continue
+            try:
+                result = await self._api(namespace, GET_LOGIN_INFO_API_SUFFIX)
+            except Exception as exc:
+                if self._is_missing_api_error(exc):
+                    continue
+                raise
+            if self._is_missing_api_result(result):
+                continue
+            if not isinstance(result, dict) or result.get("success") is False:
+                raise RuntimeError("登录信息返回失败")
+            if ("retcode" in result and (type(result["retcode"]) is not int or result["retcode"] != 0)) or ("status" in result and result["status"] != "ok"):
+                raise RuntimeError("登录信息状态无效")
+            payload = result.get("data", result.get("result", result))
+            uid = self._normalize_user_id(payload.get("user_id") or payload.get("qq") or payload.get("uin")) if isinstance(payload, dict) else ""
+            if not uid:
+                raise RuntimeError("登录信息中缺少有效 QQ")
+            if expected_account and uid != expected_account:
+                continue
+            return uid, namespace
+        raise RuntimeError("未找到 NapCat/SnowLuma 登录接口")
 
-        allowed = {
-            self._normalize_user_id(token)
-            for token in tokens
-        }
+    @staticmethod
+    def _is_missing_api_result(result: Any) -> bool:
+        # 仅识别 Host 路由层的明确错误；业务错误、未知响应和超时不能触发重发。
+        if not isinstance(result, dict) or result.get("success") is not False:
+            return False
+        error = result.get("error")
+        return isinstance(error, str) and error.startswith("未找到 API: adapter.")
 
-        return user_id in allowed
+    @staticmethod
+    def _is_missing_api_error(exc: Exception) -> bool:
+        text = str(exc)
+        return text.startswith("未找到 API: adapter.") or text.lower().startswith("api not found: adapter.")
 
-    async def _reply(
-        self,
-        stream_id: str,
-        text: str,
-    ) -> None:
+    @staticmethod
+    def _is_api_success(response: Any) -> bool:
+        if not isinstance(response, dict) or response.get("success") is False:
+            return False
+        if "retcode" in response and (type(response["retcode"]) is not int or response["retcode"] != 0):
+            return False
+        if "status" in response and response["status"] != "ok":
+            return False
+        return response.get("success") is True or response.get("status") == "ok" or (type(response.get("retcode")) is int and response["retcode"] == 0)
 
-        if not stream_id:
-            self.ctx.logger.info(
-                "无 stream_id，跳过回复：%s",
-                text,
-            )
-            return
-
+    @staticmethod
+    def _normalize_user_id(raw: Any) -> str:
+        if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+            return ""
+        value = str(raw).strip()
+        if value.lower().startswith("qq:"):
+            value = value[3:].strip()
+        if not value or len(value) > 32:
+            return ""
         try:
-            await self.ctx.send.text(
-                text,
-                stream_id,
-            )
+            digits = "".join(str(unicodedata.decimal(char)) for char in value)
+        except (ValueError, TypeError):
+            return ""
+        digits = digits.lstrip("0")
+        return digits if 5 <= len(digits) <= 12 else ""
 
-        except Exception as exc:
-            self.ctx.logger.warning(
-                "发送回复失败: %s",
-                exc,
-            )
+    @staticmethod
+    def _sender_id_from_message(message: dict[str, Any]) -> str:
+        info = message.get("message_info")
+        user = info.get("user_info") if isinstance(info, dict) else None
+        return QQLikePlugin._normalize_user_id(user.get("user_id")) if isinstance(user, dict) else ""
+
+    def _is_admin(self, user_id: str) -> bool:
+        return user_id in {self._normalize_user_id(token) for token in re.split(r"[\s,，;；]+", self.config.admin.admins or "") if token}
+
+    async def _reply(self, stream_id: str, text: str) -> None:
+        if stream_id:
+            try:
+                await self.ctx.send.text(text, stream_id)
+            except Exception:
+                self.ctx.logger.exception("发送点赞回复失败")
 
 
 def create_plugin() -> QQLikePlugin:
