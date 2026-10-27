@@ -23,7 +23,7 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+SUPPORTED_CONFIG_VERSION = "1.0.1"
 
 # 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
 # 仅在明确确认 API 不存在时切换命名空间；点赞请求出现未知异常时不自动重试，
@@ -108,7 +108,7 @@ class LikeSectionConfig(PluginConfigBase):
 
     enable_llm_tool: bool = Field(
         default=True,
-        description="启用 AI 口语化点赞；发送者从宿主接收的原始请求消息核验",
+        description="允许通过自然语言请求点赞",
     )
 
 
@@ -180,10 +180,10 @@ class QQLikePlugin(MaiBotPlugin):
 
     @Tool(
         "like_qq_profile",
-        brief_description="用户请求给自己或他人 QQ 名片点赞时调用。必须传原始请求的消息编号 source_message_id；无需让用户再发命令。身份、目标和次数由原始消息核验，禁止伪造 user_id。省略次数使用配置默认值，点满传 use_maximum=true。",
+        brief_description="用户请求给自己或他人 QQ 名片点赞时调用。必须传 Planner 消息前缀中的 msg_id 作为 source_message_id（这是消息编号，不是 QQ 号）；无需让用户再发命令。身份、目标和次数由原始消息核验，禁止伪造 user_id。省略次数使用配置默认值，点满传 use_maximum=true。",
         parameters=[
             ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING,
-                              description="发出本次点赞请求的用户消息编号，从聊天记录的消息 ID 获取，不是被回复或被点赞者的消息 ID", required=True),
+                              description="Planner 聊天记录中本次请求消息的 msg_id；这是消息编号，不是 QQ 号、目标 QQ 或昵称中的数字。必须使用发起点赞请求那条消息的编号", required=True),
             ToolParameterInfo(name="target_qq", param_type=ToolParamType.STRING,
                               description="目标 QQ，可省略；填写时必须与原始请求指向一致，给我点赞默认使用原始发言者", required=False, default=""),
             ToolParameterInfo(name="times", param_type=ToolParamType.INTEGER,
@@ -201,7 +201,7 @@ class QQLikePlugin(MaiBotPlugin):
         if self._closed:
             return self._tool_error("插件已卸载，未发送点赞。")
         try:
-            request_key, message = self._find_source_request(source_message_id)
+            request_key, message = await self._resolve_source_request(source_message_id, kwargs)
             sender = self._sender_id_from_message(message)
             if self.config.admin.admin_only and not self._is_admin(sender):
                 raise ValueError("权限不足：原始请求的发送者不是管理员。")
@@ -296,6 +296,37 @@ class QQLikePlugin(MaiBotPlugin):
         if len(candidates) != 1:
             raise ValueError("没有唯一匹配的近期原始请求，或请求已过期；请勿猜测发言者。")
         return candidates[0]
+
+    async def _resolve_source_request(self, msg_id: Any, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """从本地快照或 MaiBot 消息能力解析 Planner 消息编号。"""
+        try:
+            return self._find_source_request(msg_id)
+        except ValueError as cached_error:
+            normalized_id = str(msg_id or "").strip()
+            stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+            if not normalized_id or not stream_id:
+                raise cached_error
+            message_capability = getattr(getattr(self.ctx, "message", None), "get_by_id", None)
+            if not callable(message_capability):
+                raise cached_error
+            try:
+                resolved = await message_capability(
+                    normalized_id,
+                    chat_id=stream_id,
+                    stream_id=stream_id,
+                    include_binary_data=False,
+                )
+            except Exception:
+                self.ctx.logger.exception("按 Planner 消息编号查询原始消息失败")
+                raise cached_error
+            if not isinstance(resolved, dict):
+                raise cached_error
+            resolved_id = str(resolved.get("message_id") or "").strip()
+            resolved_session = str(resolved.get("session_id") or "").strip()
+            if resolved_id != normalized_id or resolved_session != stream_id:
+                raise cached_error
+            await self.remember_like_source(message=resolved)
+            return self._find_source_request(normalized_id)
 
     @staticmethod
     def _source_text(message: dict[str, Any]) -> str:
