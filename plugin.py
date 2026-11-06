@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import hashlib
 import math
@@ -23,7 +24,7 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "1.0.1"
+SUPPORTED_CONFIG_VERSION = "1.0.2"
 
 # 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
 # 仅在明确确认 API 不存在时切换命名空间；点赞请求出现未知异常时不自动重试，
@@ -40,6 +41,8 @@ COMMAND_PATTERN = r"/(?:点赞|赞|zan)(?=\s|$)"
 STATE_FILE_NAME = "like_state.json"
 SOURCE_TTL_SECONDS = 180
 MAX_SOURCE_MESSAGES = 512
+SCHEDULE_CHECK_SECONDS = 30
+SCHEDULE_REQUEST_TIMEOUT_SECONDS = 30
 
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
@@ -48,7 +51,8 @@ class PluginSectionConfig(PluginConfigBase):
 
     enabled: bool = Field(
         default=True,
-        description="是否启用插件",
+        description="启用命令、自然语言和定时点赞，关闭后不再发送新请求。",
+        json_schema_extra={"label": "启用插件"},
     )
 
     config_version: str = Field(
@@ -67,48 +71,56 @@ class LikeSectionConfig(PluginConfigBase):
         default=10,
         ge=1,
         le=20,
-        description="未指定次数时的默认点赞次数",
+        description="未指定次数时使用，范围 1 至 20；超过单次上限时按单次上限发送。",
+        json_schema_extra={"label": "默认点赞次数"},
     )
 
     max_times: int = Field(
         default=20,
         ge=1,
         le=20,
-        description="单次命令允许的最大点赞次数",
+        description="每次请求的上限，范围 1 至 20；命令、自然语言和定时点赞都适用，“点满”使用此值。",
+        json_schema_extra={"label": "单次点赞上限"},
     )
 
     daily_limit_per_target: int = Field(
         default=30,
         ge=1,
         le=50,
-        description="同一目标每天最多被点赞的次数",
+        description="每个目标每天的额度，范围 1 至 50；所有用户共用，结果未确认的请求也占额度。",
+        json_schema_extra={"label": "每日点赞额度"},
     )
 
     cooldown_seconds: int = Field(
         default=30,
         ge=0,
         le=3600,
-        description="同一用户触发命令的冷却秒数",
+        description="同一发送者两次点赞请求的间隔，命令和自然语言共用；范围 0 至 3600 秒，0 为关闭。",
+        json_schema_extra={"label": "冷却时间（秒）"},
     )
 
     allow_at_target: bool = Field(
         default=True,
-        description="允许通过 @某人 指定目标",
+        description="允许通过真实的 @ 消息指定点赞目标，命令和自然语言都适用。",
+        json_schema_extra={"label": "允许 @ 指定目标"},
     )
 
     allow_reply_target: bool = Field(
         default=True,
-        description="允许通过回复消息指定目标",
+        description="允许通过回复对方的消息指定点赞目标，命令和自然语言都适用。",
+        json_schema_extra={"label": "允许回复指定目标"},
     )
 
     allow_raw_qq: bool = Field(
         default=True,
-        description="允许直接输入 QQ 号指定目标",
+        description="允许直接输入 QQ 号指定目标；自然语言按昵称查找目标也需要开启此项。",
+        json_schema_extra={"label": "允许 QQ 号指定目标"},
     )
 
     enable_llm_tool: bool = Field(
         default=True,
-        description="允许通过自然语言请求点赞",
+        description="允许通过自然语言请求点赞；关闭后仍可使用命令。保存后生效。",
+        json_schema_extra={"label": "启用自然语言点赞"},
     )
 
 
@@ -119,13 +131,46 @@ class AdminSectionConfig(PluginConfigBase):
 
     admin_only: bool = Field(
         default=True,
-        description="是否仅允许管理员使用（默认开启，需在下方配置管理员QQ，否则所有人都无法使用）",
+        description="仅允许下方管理员使用命令和自然语言点赞；开启后管理员列表不能为空。关闭后仍有冷却和每日额度限制，不影响定时名单。",
+        json_schema_extra={"label": "仅管理员可用"},
     )
 
     admins: str = Field(
         default="",
-        description="管理员 QQ 号，逗号分隔（开启 admin_only 后必填）",
-        json_schema_extra={"placeholder": "123456789, qq:987654321"},
+        description="管理员 QQ 号，多个号码用逗号分隔；开启“仅管理员可用”时必填。",
+        json_schema_extra={"label": "管理员 QQ 号", "placeholder": "123456789, 987654321"},
+    )
+
+
+class ScheduleSectionConfig(PluginConfigBase):
+    __ui_label__ = "定时点赞"
+    __ui_icon__ = "schedule"
+    __ui_order__ = 3
+
+    enabled: bool = Field(
+        default=False,
+        description="每天到点给名单中的 QQ 点赞；需要同时启用插件。保存后生效。",
+        json_schema_extra={"label": "启用定时点赞"},
+    )
+
+    time: str = Field(
+        default="09:00",
+        description="每天执行的时间，使用 24 小时制 HH:MM，例如 09:00、21:30；按运行 MaiBot 的电脑时区计算。",
+        json_schema_extra={"label": "每天执行时间", "placeholder": "09:00"},
+    )
+
+    qq_list: str = Field(
+        default="",
+        description="要点赞的 QQ 号，用逗号、空格或换行分隔；重复号码只执行一次，无效号码跳过。",
+        json_schema_extra={"label": "定时点赞 QQ 名单", "placeholder": "123456789, 987654321"},
+    )
+
+    times: int = Field(
+        default=10,
+        ge=1,
+        le=20,
+        description="名单中每人每天的点赞次数，范围 1 至 20；仍受单次上限和每日额度限制。",
+        json_schema_extra={"label": "每人点赞次数"},
     )
 
 
@@ -142,6 +187,10 @@ class QQLikeConfig(PluginConfigBase):
         default_factory=AdminSectionConfig
     )
 
+    schedule: ScheduleSectionConfig = Field(
+        default_factory=ScheduleSectionConfig
+    )
+
 
 
 class QQLikePlugin(MaiBotPlugin):
@@ -154,6 +203,8 @@ class QQLikePlugin(MaiBotPlugin):
         self._storage_error = ""
         self._closed = True
         self._source_messages: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._schedule_task: asyncio.Task[None] | None = None
+        self._schedule_wakeup: asyncio.Event | None = None
 
     async def on_load(self) -> None:
         try:
@@ -167,16 +218,154 @@ class QQLikePlugin(MaiBotPlugin):
             self._storage_error = "点赞账本读取或迁移失败，请检查数据文件与权限；已暂停发送。"
             self.ctx.logger.exception(self._storage_error)
         self._closed = False
-        self.ctx.logger.info("QQ 点赞插件已加载；AI 口语化点赞按原始请求消息核验身份。")
+        self._warn_config()
+        self._sync_schedule_task()
+        self.ctx.logger.info("QQ 点赞插件已加载。")
 
     async def on_unload(self) -> None:
         # 每条请求单独持久化；旧实例卸载不能覆写新实例的账本。
         self._closed = True
         self._source_messages.clear()
+        task, self._schedule_task = self._schedule_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._schedule_wakeup = None
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
+            self._warn_config()
+            if not self.config.plugin.enabled or not self.config.like.enable_llm_tool:
+                self._source_messages.clear()
+            self._sync_schedule_task()
             self.ctx.logger.info("QQ 点赞配置已更新 version=%s", version)
+
+    def _warn_config(self) -> None:
+        if self.config.admin.admin_only and not any(
+            self._normalize_user_id(value) for value in re.split(r"[\s,，;；]+", self.config.admin.admins)
+        ):
+            self.ctx.logger.warning("仅管理员可用已开启，但未填写有效的管理员 QQ；聊天点赞不可用，请在插件设置中填写。定时名单不受影响。")
+        if self.config.like.default_times > self.config.like.max_times:
+            self.ctx.logger.warning("默认点赞次数超过单次上限，未指定次数时将按单次上限发送。")
+        if self.config.schedule.enabled:
+            if not self._schedule_time_valid():
+                self.ctx.logger.warning("定时点赞时间无效，请填写 24 小时制 HH:MM，例如 09:00；定时任务暂停。")
+            targets, invalid = self._schedule_targets()
+            if not targets:
+                self.ctx.logger.warning("定时点赞名单中没有有效 QQ，请在插件设置中填写。")
+            if invalid:
+                self.ctx.logger.warning("定时点赞名单中有 %s 个无效号码，已跳过。", invalid)
+            if self.config.schedule.times > self.config.like.max_times:
+                self.ctx.logger.warning("定时点赞次数超过单次上限，将按单次上限发送。")
+
+    def _schedule_time_valid(self) -> bool:
+        return re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", self.config.schedule.time.strip()) is not None
+
+    def _schedule_targets(self) -> tuple[tuple[str, ...], int]:
+        targets, invalid = {}, 0
+        for token in re.split(r"[\s,，;；]+", self.config.schedule.qq_list.strip()):
+            if not token:
+                continue
+            target = self._normalize_user_id(token)
+            if target:
+                targets[target] = None
+            else:
+                invalid += 1
+        return tuple(targets), invalid
+
+    def _schedule_plan(self) -> tuple[str, tuple[str, ...], int] | None:
+        if (self._closed or self._storage_error or not self.config.plugin.enabled or
+                not self.config.schedule.enabled or not self._schedule_time_valid()):
+            return None
+        targets, _ = self._schedule_targets()
+        if not targets:
+            return None
+        return (self.config.schedule.time.strip(), targets,
+                min(self.config.schedule.times, self.config.like.max_times))
+
+    def _sync_schedule_task(self) -> None:
+        if self._schedule_plan() is not None and (self._schedule_task is None or self._schedule_task.done()):
+            self._schedule_wakeup = asyncio.Event()
+            self._schedule_task = asyncio.create_task(self._schedule_loop(), name="qq-like-daily")
+        if self._schedule_wakeup is not None:
+            self._schedule_wakeup.set()
+
+    async def _schedule_loop(self) -> None:
+        while not self._closed:
+            wakeup = self._schedule_wakeup
+            if wakeup is None:
+                return
+            wakeup.clear()
+            try:
+                await self._run_schedule_once()
+            except Exception:
+                self.ctx.logger.exception("定时点赞检查失败，将在下次检查时继续；已提交的请求不会重发。")
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=SCHEDULE_CHECK_SECONDS)
+            except TimeoutError:
+                pass
+
+    @staticmethod
+    def _schedule_key(day: str, target: str) -> str:
+        return f"schedule:{day}:{target}"
+
+    def _schedule_recorded(self, key: str) -> bool:
+        connection = self._connect()
+        try:
+            return (connection.execute("SELECT 1 FROM metadata WHERE key=?", (key,)).fetchone() is not None or
+                    connection.execute("SELECT 1 FROM requests WHERE id=?", (key,)).fetchone() is not None)
+        finally:
+            connection.close()
+
+    def _skip_schedule(self, key: str) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("INSERT OR IGNORE INTO metadata VALUES (?, ?)", (key, "skipped"))
+            connection.commit()
+        finally:
+            connection.close()
+
+    async def _run_schedule_once(self) -> None:
+        plan = self._schedule_plan()
+        if plan is None:
+            return
+        local = time.localtime()
+        day = time.strftime("%Y-%m-%d", local)
+        if time.strftime("%H:%M", local) < plan[0]:
+            return
+        for target in plan[1]:
+            if self._schedule_plan() != plan or time.strftime("%Y-%m-%d") != day:
+                return
+            key = self._schedule_key(day, target)
+            if self._schedule_recorded(key):
+                continue
+            try:
+                # 限制单个号码的等待时间，避免连接故障阻塞整份名单。
+                await asyncio.wait_for(self._perform_scheduled_like(target, day, plan), timeout=SCHEDULE_REQUEST_TIMEOUT_SECONDS)
+            except Exception:
+                self.ctx.logger.exception("定时点赞未完成 target=%s；已提交的请求不会重发。", target)
+
+    async def _perform_scheduled_like(self, target: str, day: str, plan: tuple[str, tuple[str, ...], int]) -> None:
+        self_id, namespace = await self._get_account()
+        # 登录查询期间可能跨日或修改配置，发送前按当前配置复查。
+        if (self._schedule_plan() != plan or time.strftime("%Y-%m-%d") != day or
+                time.strftime("%H:%M") < plan[0]):
+            return
+        key = self._schedule_key(day, target)
+        if target == self_id:
+            self._skip_schedule(key)
+            self.ctx.logger.warning("定时点赞跳过机器人自身 target=%s", target)
+            return
+        reservation = self._reserve_like(target, "", plan[2], request_key=key, schedule_day=day)
+        if isinstance(reservation, str):
+            self.ctx.logger.info("定时点赞跳过 target=%s: %s", target, reservation)
+            return
+        ok, reply = await self._submit_reserved_like(namespace, target, reservation)
+        if not ok:
+            self.ctx.logger.warning("定时点赞 target=%s: %s", target, reply)
 
     @Tool(
         "like_qq_profile",
@@ -221,7 +410,7 @@ class QQLikePlugin(MaiBotPlugin):
             if target_qq and self._normalize_user_id(target_qq) != target:
                 raise ValueError("工具目标与原始请求不一致，未发送点赞。")
             ok, reply = await self._perform_like(target, count, sender, expected_account=account,
-                                                request_key=request_key)
+                                                request_key=request_key, source_message=message)
             return {"success": ok, "content": reply, "error": "" if ok else reply}
         except ValueError as exc:
             return self._tool_error(str(exc))
@@ -273,7 +462,7 @@ class QQLikePlugin(MaiBotPlugin):
                 clean.append({"type": kind, "data": selected})
         if message.get("account_id") and not self._normalize_user_id(message["account_id"]):
             return result
-        snapshot = {key: message.get(key) for key in ("message_id", "platform", "session_id", "account_id", "scope")}
+        snapshot = {key: message.get(key) for key in ("message_id", "platform", "session_id", "account_id", "scope", "timestamp")}
         user = message["message_info"]["user_info"]
         snapshot["message_info"] = {"user_info": {key: value for key, value in user.items()
             if key in {"user_id", "user_nickname", "user_cardname"} and isinstance(value, (str, int)) and len(str(value)) <= 128}}
@@ -282,28 +471,37 @@ class QQLikePlugin(MaiBotPlugin):
             snapshot.get("scope"), session, msg_id, sender], ensure_ascii=False).encode()).hexdigest()
         now = time.monotonic()
         self._source_messages = {key: value for key, value in self._source_messages.items() if now - value[0] <= SOURCE_TTL_SECONDS}
-        self._source_messages.setdefault(request_key, (now, snapshot))
+        created = now - max(0, time.time() - timestamp)
+        self._source_messages.setdefault(request_key, (created, snapshot))
         while len(self._source_messages) > MAX_SOURCE_MESSAGES:
             self._source_messages.pop(next(iter(self._source_messages)))
         return result
 
-    def _find_source_request(self, msg_id: Any) -> tuple[str, dict[str, Any]]:
+    def _find_source_request(self, msg_id: Any, stream_id: str = "") -> tuple[str, dict[str, Any]]:
         if not isinstance(msg_id, str) or not msg_id.strip():
             raise ValueError("缺少原始请求消息编号，请使用聊天记录中发出点赞请求的消息 ID。")
         now = time.monotonic()
         candidates = [(key, message) for key, (created, message) in self._source_messages.items()
-                      if now - created <= SOURCE_TTL_SECONDS and message["message_id"] == msg_id.strip()]
+                      if now - created <= SOURCE_TTL_SECONDS and message["message_id"] == msg_id.strip()
+                      and (not stream_id or message["session_id"] == stream_id)]
         if len(candidates) != 1:
             raise ValueError("没有唯一匹配的近期原始请求，或请求已过期；请勿猜测发言者。")
         return candidates[0]
 
     async def _resolve_source_request(self, msg_id: Any, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """从本地快照或 MaiBot 消息能力解析 Planner 消息编号。"""
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
+        chat_id = str(kwargs.get("chat_id") or "").strip()
+        if chat_id and chat_id != stream_id:
+            raise ValueError("当前聊天流信息不一致，未发送点赞。")
+        if kwargs.get("platform") and str(kwargs["platform"]).strip().lower() != "qq":
+            raise ValueError("本插件仅支持 QQ 平台。")
+        if not isinstance(msg_id, str) or not msg_id.strip():
+            raise ValueError("缺少原始请求消息编号，请使用聊天记录中发出点赞请求的消息 ID。")
         try:
-            return self._find_source_request(msg_id)
+            return self._find_source_request(msg_id, stream_id)
         except ValueError as cached_error:
             normalized_id = str(msg_id or "").strip()
-            stream_id = str(kwargs.get("stream_id") or kwargs.get("chat_id") or "").strip()
             if not normalized_id or not stream_id:
                 raise cached_error
             message_capability = getattr(getattr(self.ctx, "message", None), "get_by_id", None)
@@ -326,7 +524,7 @@ class QQLikePlugin(MaiBotPlugin):
             if resolved_id != normalized_id or resolved_session != stream_id:
                 raise cached_error
             await self.remember_like_source(message=resolved)
-            return self._find_source_request(normalized_id)
+            return self._find_source_request(normalized_id, stream_id)
 
     @staticmethod
     def _source_text(message: dict[str, Any]) -> str:
@@ -454,7 +652,7 @@ class QQLikePlugin(MaiBotPlugin):
             account = message.get("account_id") or ""
             if account and not self._normalize_user_id(account):
                 raise ValueError("无法核验消息所属的机器人账号。")
-            ok, reply = await self._perform_like(target, count, sender, expected_account=account)
+            ok, reply = await self._perform_like(target, count, sender, expected_account=account, source_message=message)
         except ValueError as exc:
             ok, reply = False, str(exc)
         await self._reply(stream, reply)
@@ -534,7 +732,7 @@ class QQLikePlugin(MaiBotPlugin):
             raise ValueError(f"点赞次数必须在 1 到 {self.config.like.max_times} 之间。")
         return count
 
-    async def _perform_like(self, target_id: str, times: int, sender_id: str, *, expected_account: str = "", request_key: str = "") -> tuple[bool, str]:
+    async def _perform_like(self, target_id: str, times: int, sender_id: str, *, expected_account: str = "", request_key: str = "", source_message: dict[str, Any] | None = None) -> tuple[bool, str]:
         if self._closed or not self.config.plugin.enabled:
             return False, "点赞功能当前未启用。"
         if self._storage_error:
@@ -560,6 +758,24 @@ class QQLikePlugin(MaiBotPlugin):
             return False, "插件已停用或正在卸载，未发送点赞。"
         if self.config.admin.admin_only and not self._is_admin(sender):
             return False, "权限配置已更新，当前用户无权执行点赞。"
+        if request_key and not self.config.like.enable_llm_tool:
+            return False, "自然语言点赞已关闭，未发送请求。"
+        if source_message is not None:
+            try:
+                if request_key:
+                    _, current = self._find_source_request(source_message["message_id"], source_message["session_id"])
+                    text = self._source_text(current)
+                    current_target = self._oral_target(current, text, self_id)
+                    current_times, _ = self._oral_times(text)
+                else:
+                    parsed = self._parse_message(source_message)
+                    if parsed is None:
+                        raise ValueError("原始消息不是点赞命令，未发送请求。")
+                    current_target, current_times = parsed
+                if (current_target, current_times) != (target, times):
+                    raise ValueError("点赞配置已更新，请按当前配置重新发送请求。")
+            except ValueError as exc:
+                return False, str(exc)
         try:
             reservation = self._reserve_like(target, sender, times, request_key=request_key)
         except Exception:
@@ -567,6 +783,9 @@ class QQLikePlugin(MaiBotPlugin):
             return False, "点赞账本无法写入，未发送请求，请检查文件和磁盘。"
         if isinstance(reservation, str):
             return False, reservation
+        return await self._submit_reserved_like(namespace, target, reservation)
+
+    async def _submit_reserved_like(self, namespace: str, target: str, reservation: tuple[str, int]) -> tuple[bool, str]:
         request_id, count = reservation
         try:
             response = await self._api(namespace, SEND_LIKE_API_SUFFIX, {"user_id": int(target), "times": count})
@@ -672,12 +891,17 @@ class QQLikePlugin(MaiBotPlugin):
                                    (uuid.uuid4().hex, day, target, "", count, 0, "confirmed"))
         connection.executemany("INSERT INTO legacy_cooldowns VALUES (?,?)", cooldowns.items())
 
-    def _reserve_like(self, target: str, sender: str, requested: int, *, request_key: str = "") -> tuple[str, int] | str:
+    def _reserve_like(self, target: str, sender: str, requested: int, *, request_key: str = "", schedule_day: str = "") -> tuple[str, int] | str:
         connection = self._connect()
         try:
+            now, today = time.time(), time.strftime("%Y-%m-%d")
+            if schedule_day:
+                if schedule_day != today or sender or request_key != self._schedule_key(today, target):
+                    return "定时任务日期已变更或参数无效，未发送请求。"
+                if connection.execute("SELECT 1 FROM metadata WHERE key=?", (request_key,)).fetchone():
+                    return "该号码今天的定时任务已处理，不会重复执行。"
             if request_key and connection.execute("SELECT 1 FROM requests WHERE id=?", (request_key,)).fetchone():
                 return "这条原始消息已处理或结果待确认，不会重复发送点赞。"
-            now, today = time.time(), time.strftime("%Y-%m-%d")
             # 未确认请求跨日继续占额，防止昨天的迟到请求与今天额度叠加。
             used = connection.execute("SELECT COALESCE(SUM(times),0) FROM requests WHERE target=? AND (day>=? OR state!='confirmed')", (target, today)).fetchone()[0]
             last = connection.execute("SELECT COALESCE(MAX(created),0) FROM requests WHERE sender=?", (sender,)).fetchone()[0]
@@ -686,13 +910,18 @@ class QQLikePlugin(MaiBotPlugin):
                 if row:
                     last = max(last, row[0])
             cooldown = self.config.like.cooldown_seconds
-            if cooldown and now - last < cooldown:
+            if not schedule_day and cooldown and now - last < cooldown:
                 return f"别急，{math.ceil(cooldown - (now - last))} 秒后再试吧。"
             remaining = self.config.like.daily_limit_per_target - used
             if remaining <= 0:
+                if schedule_day:
+                    connection.execute("INSERT INTO metadata VALUES (?, ?)", (request_key, "skipped"))
+                    connection.commit()
                 return "该目标今日额度已用完或被未确认请求占用，请勿重复触发。"
             count, request_id = min(requested, remaining, self.config.like.max_times), request_key or uuid.uuid4().hex
             connection.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?)", (request_id, today, target, sender, count, now, "reserved"))
+            if schedule_day:
+                connection.execute("INSERT INTO metadata VALUES (?, ?)", (request_key, "submitted"))
             connection.commit()
             return request_id, count
         finally:
@@ -746,11 +975,8 @@ class QQLikePlugin(MaiBotPlugin):
                 raise
             if self._is_missing_api_result(result):
                 continue
-            if not isinstance(result, dict) or result.get("success") is False:
-                raise RuntimeError("登录信息返回失败")
-            if ("retcode" in result and (type(result["retcode"]) is not int or result["retcode"] != 0)) or ("status" in result and result["status"] != "ok"):
-                raise RuntimeError("登录信息状态无效")
-            payload = result.get("data", result.get("result", result))
+            layers = self._api_response_layers(result)
+            payload = layers[-1]
             uid = self._normalize_user_id(payload.get("user_id") or payload.get("qq") or payload.get("uin")) if isinstance(payload, dict) else ""
             if not uid:
                 raise RuntimeError("登录信息中缺少有效 QQ")
@@ -773,14 +999,39 @@ class QQLikePlugin(MaiBotPlugin):
         return text.startswith("未找到 API: adapter.") or text.lower().startswith("api not found: adapter.")
 
     @staticmethod
-    def _is_api_success(response: Any) -> bool:
-        if not isinstance(response, dict) or response.get("success") is False:
+    def _api_response_layers(response: Any) -> list[dict[str, Any]]:
+        layers = []
+        for _ in range(8):
+            if not isinstance(response, dict):
+                raise ValueError("适配器返回格式无效。")
+            if "success" in response and response["success"] is not True:
+                raise ValueError("适配器返回失败。")
+            if "retcode" in response and (type(response["retcode"]) is not int or response["retcode"] != 0):
+                raise ValueError("适配器返回非成功状态。")
+            if "status" in response and response["status"] != "ok":
+                raise ValueError("适配器返回非成功状态。")
+            if response.get("error"):
+                raise ValueError("适配器返回错误信息。")
+            layers.append(response)
+            if "result" in response:
+                response = response["result"]
+            elif isinstance(response.get("data"), dict):
+                response = response["data"]
+            else:
+                return layers
+        raise ValueError("适配器返回嵌套过深。")
+
+    @classmethod
+    def _is_api_success(cls, response: Any) -> bool:
+        try:
+            layers = cls._api_response_layers(response)
+        except ValueError:
             return False
-        if "retcode" in response and (type(response["retcode"]) is not int or response["retcode"] != 0):
-            return False
-        if "status" in response and response["status"] != "ok":
-            return False
-        return response.get("success") is True or response.get("status") == "ok" or (type(response.get("retcode")) is int and response["retcode"] == 0)
+        # result 的外层 success 只表示转发成功，不能据此判断 QQ 侧的处理结果。
+        return any("result" not in layer and (
+            layer.get("success") is True or layer.get("status") == "ok" or
+            (type(layer.get("retcode")) is int and layer["retcode"] == 0)
+        ) for layer in layers)
 
     @staticmethod
     def _normalize_user_id(raw: Any) -> str:
