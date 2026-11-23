@@ -24,12 +24,12 @@ from maibot_sdk.types import (
     ToolParamType,
 )
 
-SUPPORTED_CONFIG_VERSION = "1.0.3"
+SUPPORTED_CONFIG_VERSION = "1.0.4"
 
-# 兼容新版统一连接器（SnowLuma 命名空间）和旧版 NapCat 适配器。
+# 优先使用通用 OneBot v11 接口，兼容旧版 SnowLuma、NapCat 适配器。
 # 仅在明确确认 API 不存在时切换命名空间；点赞请求出现未知异常时不自动重试，
 # 避免请求已经在 QQ 侧执行但响应丢失时造成重复点赞。
-ADAPTER_NAMESPACES = ("adapter.snowluma", "adapter.napcat")
+ADAPTER_NAMESPACES = ("adapter.onebot", "adapter.snowluma", "adapter.napcat")
 ADAPTER_API_VERSION = "1"
 SEND_LIKE_API_SUFFIX = ".account.send_like"
 GET_LOGIN_INFO_API_SUFFIX = ".system.get_login_info"
@@ -947,7 +947,7 @@ class QQLikePlugin(MaiBotPlugin):
 
     async def _api(self, namespace: str, suffix: str, params: dict[str, Any] | None = None) -> Any:
         options: dict[str, Any] = {}
-        if namespace == "adapter.snowluma":
+        if namespace in ("adapter.onebot", "adapter.snowluma"):
             options["version"] = ADAPTER_API_VERSION
         if params is not None:
             options["params"] = params
@@ -955,7 +955,7 @@ class QQLikePlugin(MaiBotPlugin):
 
     async def _get_account(self, expected_account: str = "") -> tuple[str, str]:
         for namespace in ADAPTER_NAMESPACES:
-            version = ADAPTER_API_VERSION if namespace == "adapter.snowluma" else ""
+            version = ADAPTER_API_VERSION if namespace in ("adapter.onebot", "adapter.snowluma") else ""
             # 先查询无副作用的 API 元信息，缺少登录或点赞接口时直接检查下一种适配器。
             available = True
             for suffix in (GET_LOGIN_INFO_API_SUFFIX, SEND_LIKE_API_SUFFIX):
@@ -983,7 +983,7 @@ class QQLikePlugin(MaiBotPlugin):
             if expected_account and uid != expected_account:
                 continue
             return uid, namespace
-        raise RuntimeError("未找到 NapCat/SnowLuma 登录接口")
+        raise RuntimeError("未找到支持名片点赞的适配器接口，请检查 MaiBot OneBot 适配器或旧版适配器。")
 
     @staticmethod
     def _is_missing_api_result(result: Any) -> bool:
